@@ -1,0 +1,15 @@
+node_modules
+.output
+dist
+.vinxi
+.tanstack
+data
+public/uploads
+ml/.venv
+ml/output
+ml/dataset/**/*
+!ml/dataset/**/README.txt
+*.local
+.env
+.env.*
+!.env.example
