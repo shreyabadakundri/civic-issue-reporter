@@ -9,7 +9,10 @@
     "start": "node .output/server/index.mjs",
     "ml:prepare": "python ml/prepare_dataset.py",
     "ml:samples": "python ml/download_samples.py",
-    "ml:train": "python ml/train.py"
+    "ml:import-kaggle": "python ml/import_kaggle_datasets.py",
+    "ml:train": "python ml/train.py",
+    "ml:train:quick": "python ml/train.py --quick",
+    "ml:export": "python ml/export_tfjs.py"
   },
   "dependencies": {
     "@radix-ui/react-accordion": "^1.2.12",

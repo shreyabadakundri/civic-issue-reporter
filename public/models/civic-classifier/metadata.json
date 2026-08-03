@@ -1,0 +1,10 @@
+{
+  "labels": [
+    "garbage",
+    "manhole",
+    "pothole"
+  ],
+  "imageSize": 224,
+  "model": "MobileNetV2",
+  "note": "Class order must match folder names (alphabetical)."
+}
