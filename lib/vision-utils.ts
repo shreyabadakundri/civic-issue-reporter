@@ -1,8 +1,8 @@
 import type { IssueType } from "./constants";
 import type { ImageClassificationResult } from "./types";
 
-export const LOCAL_MODEL_PATH = "/models/civic-classifier/model.json";
-export const LOCAL_MODEL_METADATA_PATH = "/models/civic-classifier/metadata.json";
+export const LOCAL_MODEL_PATH = "/models/civic-classifier/model.json?v=3";
+export const LOCAL_MODEL_METADATA_PATH = "/models/civic-classifier/metadata.json?v=3";
 
 export type LocalModelMetadata = {
   labels: IssueType[];

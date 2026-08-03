@@ -220,7 +220,7 @@ function ReportFlow({
         if (localResult) {
           setClassification(localResult);
           setIssueType(localResult.issueType);
-          toast.success(`Detected: ${ISSUE_META[localResult.issueType].label}`, {
+          toast.success(`Auto-confirmed: ${ISSUE_META[localResult.issueType].label}`, {
             description: `${Math.round(localResult.confidence * 100)}% · Local trained model`,
           });
           return;
@@ -234,7 +234,7 @@ function ReportFlow({
       const result = await classifyReportImage({ data: formData });
       setClassification(result);
       setIssueType(result.issueType);
-      toast.success(`Detected: ${ISSUE_META[result.issueType].label}`, {
+      toast.success(`Auto-confirmed: ${ISSUE_META[result.issueType].label}`, {
         description: `${Math.round(result.confidence * 100)}% confidence · ${result.reason}`,
       });
     } catch (error) {
@@ -395,8 +395,15 @@ function ReportFlow({
                         )}
                       </div>
                       <p className="text-xs text-muted-foreground">{classification.reason}</p>
-                      {classification.confidence < 0.6 && (
-                        <p className="text-xs text-amber-400">Low confidence — please confirm the issue type below.</p>
+                      {issueType && (
+                        <p className="flex items-center gap-1.5 text-xs text-emerald-300">
+                          <CheckCircle2 className="h-3.5 w-3.5" />
+                          Issue type auto-confirmed as {ISSUE_META[issueType].label}
+                          {manualOverride ? " (you changed it)" : ""}
+                        </p>
+                      )}
+                      {classification.confidence < 0.45 && !manualOverride && (
+                        <p className="text-xs text-amber-400">Low confidence — you can change the type below if needed.</p>
                       )}
                     </div>
                   ) : null}
@@ -405,9 +412,15 @@ function ReportFlow({
 
               <div className="grid sm:grid-cols-2 gap-5 mt-5">
                 <div className="space-y-2">
-                  <Label>{classification ? "Confirm Issue Type" : "Issue Type"}</Label>
+                  <Label>
+                    {classification && issueType && !manualOverride
+                      ? "Issue Type (auto-confirmed)"
+                      : classification
+                        ? "Issue Type"
+                        : "Issue Type"}
+                  </Label>
                   <Select
-                    value={issueType}
+                    value={issueType || undefined}
                     onValueChange={(v) => handleIssueTypeChange(v as IssueType)}
                     disabled={classifying || !imageFile}
                   >
@@ -420,6 +433,9 @@ function ReportFlow({
                       <SelectItem value="manhole">⚠  Manhole Defect</SelectItem>
                     </SelectContent>
                   </Select>
+                  {classification && issueType && !manualOverride && (
+                    <p className="text-xs text-muted-foreground">Filled automatically from your photo. Change only if wrong.</p>
+                  )}
                   {manualOverride && (
                     <p className="text-xs text-amber-400">Manual override active — using your selection instead of AI.</p>
                   )}

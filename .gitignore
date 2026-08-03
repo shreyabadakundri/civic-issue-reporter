@@ -13,3 +13,8 @@ ml/dataset/**/*
 .env
 .env.*
 !.env.example
+
+ml/raw/
+ml/**/__pycache__/
+*.pyc
+

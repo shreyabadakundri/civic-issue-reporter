@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import types
 from pathlib import Path
 
 import tensorflow as tf
@@ -34,7 +35,8 @@ TFJS_DIR = ROOT.parent / "public" / "models" / "civic-classifier"
 
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 16
-EPOCHS = 20
+EPOCHS = 15
+QUICK_EPOCHS = 12
 MIN_IMAGES_PER_CLASS = 5
 
 
@@ -64,25 +66,37 @@ def validate_dataset() -> list[str]:
     return problems
 
 
-def build_model(num_classes: int) -> keras.Model:
+def build_model(num_classes: int, fine_tune: bool = True) -> keras.Model:
     base = keras.applications.MobileNetV2(
         input_shape=(*IMG_SIZE, 3),
         include_top=False,
         weights="imagenet",
     )
-    base.trainable = False
+    # Unfreeze last blocks so pothole vs manhole features can separate.
+    base.trainable = fine_tune
+    if fine_tune:
+        for layer in base.layers[:-40]:
+            layer.trainable = False
 
     inputs = keras.Input(shape=(*IMG_SIZE, 3))
     x = keras.applications.mobilenet_v2.preprocess_input(inputs)
     x = base(x, training=False)
     x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dropout(0.35)(x)
+    x = layers.Dense(128, activation="relu")(x)
     x = layers.Dropout(0.25)(x)
     outputs = layers.Dense(num_classes, activation="softmax")(x)
     return keras.Model(inputs, outputs)
 
 
 def main() -> None:
-    print("CivicMind AI — local vision trainer\n")
+    quick = "--quick" in sys.argv
+    epochs = QUICK_EPOCHS if quick else EPOCHS
+    print("CivicMind AI — local vision trainer")
+    if quick:
+        print(f"(quick mode: {epochs} epochs)\n")
+    else:
+        print()
 
     if not TRAIN_DIR.exists():
         raise SystemExit("Run first: python ml/prepare_dataset.py")
@@ -138,25 +152,41 @@ def main() -> None:
     labels = sorted(class_indices, key=lambda k: class_indices[k])
     print(f"Classes (index order): {labels}")
 
-    model = build_model(num_classes=len(labels))
+    # Class weights: up-weight weaker classes so manhole doesn't dominate.
+    counts = {label: float(count_images(TRAIN_DIR / label)) for label in labels}
+    total = sum(counts.values()) or 1.0
+    class_weight = {
+        class_indices[label]: (total / (len(labels) * max(1.0, counts[label])))
+        for label in labels
+    }
+    # Extra nudge: pothole & garbage often confused with manhole/road texture
+    if "pothole" in class_indices:
+        class_weight[class_indices["pothole"]] *= 1.2
+    if "garbage" in class_indices:
+        class_weight[class_indices["garbage"]] *= 1.35
+    print(f"Class weights: { {labels[i]: round(w, 3) for i, w in class_weight.items()} }")
+
+    model = build_model(num_classes=len(labels), fine_tune=True)
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+        optimizer=keras.optimizers.Adam(learning_rate=5e-5),
         loss="categorical_crossentropy",
         metrics=["accuracy"],
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     callbacks = [
-        keras.callbacks.EarlyStopping(patience=4, restore_best_weights=True, monitor="val_accuracy"),
+        keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True, monitor="val_accuracy"),
         keras.callbacks.ModelCheckpoint(KERAS_PATH, save_best_only=True, monitor="val_accuracy"),
+        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6),
     ]
 
     print("\nTraining…")
     history = model.fit(
         train_flow,
         validation_data=val_flow,
-        epochs=EPOCHS,
+        epochs=epochs,
         callbacks=callbacks,
+        class_weight=class_weight,
     )
 
     model.save(KERAS_PATH)
@@ -168,9 +198,7 @@ def main() -> None:
     TFJS_DIR.mkdir(parents=True, exist_ok=True)
 
     print("\nExporting TensorFlow.js model…")
-    import tensorflowjs as tfjs
-
-    tfjs.converters.save_keras_model(model, str(TFJS_DIR))
+    export_tfjs(model, TFJS_DIR)
 
     metadata = {
         "labels": labels,
@@ -182,6 +210,53 @@ def main() -> None:
 
     print(f"Exported TF.js model: {TFJS_DIR}")
     print("\nDone! Restart npm run dev and upload a photo to test local classification.")
+
+
+def _stub_package(name: str) -> types.ModuleType:
+    """Create a fake package so optional tensorflowjs imports don't crash."""
+    parts = name.split(".")
+    parent: types.ModuleType | None = None
+    for i, part in enumerate(parts):
+        full = ".".join(parts[: i + 1])
+        mod = sys.modules.get(full)
+        if mod is None:
+            mod = types.ModuleType(full)
+            mod.__path__ = []  # mark as package
+            sys.modules[full] = mod
+            if parent is not None:
+                setattr(parent, part, mod)
+        parent = mod
+    assert parent is not None
+    return parent
+
+
+def export_tfjs(model: keras.Model, tfjs_dir: Path) -> None:
+    """Export Keras model to TF.js, stubbing optional deps that break on Python 3.13."""
+    # tensorflowjs imports these at module load even for plain Keras conversion.
+    for name in (
+        "tensorflow_decision_forests",
+        "tensorflow_hub",
+        "flax",
+        "flax.linen",
+        "flax.training",
+        "jax",
+        "jax.experimental",
+        "jax.experimental.jax2tf",
+        "jax.numpy",
+        "jaxlib",
+    ):
+        _stub_package(name)
+
+    try:
+        import tensorflowjs as tfjs
+    except ImportError as exc:
+        raise SystemExit(
+            "tensorflowjs is not installed. Activate ml/.venv and run:\n"
+            '  pip install "tensorflowjs==4.22.0" --no-deps tf_keras scipy importlib_resources\n'
+            f"Original error: {exc}"
+        ) from exc
+
+    tfjs.converters.save_keras_model(model, str(tfjs_dir))
 
 
 if __name__ == "__main__":

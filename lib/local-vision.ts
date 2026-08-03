@@ -15,8 +15,17 @@ let backendReady: Promise<void> | undefined;
 let modelPromise: Promise<import("@tensorflow/tfjs").LayersModel | null> | undefined;
 let metadata: LocalModelMetadata | null | undefined;
 let tfModule: TfModule | undefined;
+let loadedModelMtime = 0;
 
 const MODEL_DIR = path.join(process.cwd(), "public", "models", "civic-classifier");
+
+function modelDirMtime(): number {
+  try {
+    return fs.statSync(path.join(MODEL_DIR, "model.json")).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
 
 async function getTf() {
   if (!tfModule) {
@@ -61,7 +70,13 @@ async function loadModel() {
 }
 
 async function getModel() {
+  const mtime = modelDirMtime();
+  if (modelPromise && mtime !== loadedModelMtime) {
+    modelPromise = undefined;
+    metadata = undefined;
+  }
   if (!modelPromise) {
+    loadedModelMtime = mtime;
     modelPromise = loadModel().catch(() => null);
   }
   return modelPromise;
