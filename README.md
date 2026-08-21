@@ -44,6 +44,18 @@ npm run dev
 
 After training, the app shows **"Local ML Model"** when classifying photos.
 
+## Optional: Cohere vision + NLP (recommended)
+
+Set these in a `.env` file for **automatic photo classification** and smarter description scoring:
+
+```env
+COHERE_API_KEY=your_key_here
+COHERE_VISION_MODEL=command-a-vision-07-2025
+COHERE_NLP_MODEL=command-a-03-2025
+```
+
+Classification priority: **Cohere → OpenAI → local MobileNetV2 → keyword fallback**.
+
 ## Optional: OpenAI vision
 
 Set these in a `.env` file for **automatic photo classification** from image content:

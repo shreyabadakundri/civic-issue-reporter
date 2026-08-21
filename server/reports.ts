@@ -154,7 +154,7 @@ export const submitReport = createServerFn({ method: "POST" })
       imageMimeType: image.type || "image/jpeg",
       visionConfidence: classification.confidence,
       classificationReason: classification.reason,
-      usedOpenAiVision: classification.usedOpenAi,
+      usedCloudVision: classification.usedCloudVision,
     });
 
     const status: ReportStatus = analysis.routed ? "routed" : "manual_review";
