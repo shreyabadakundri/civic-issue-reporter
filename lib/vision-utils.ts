@@ -41,7 +41,7 @@ export function buildClassificationFromScores(
     issueType: top.issueType,
     confidence: Math.max(0.15, Math.min(0.99, top.confidence)),
     reason: `${reasonPrefix}: ${top.issueType} (${Math.round(top.confidence * 100)}%)`,
-    usedOpenAi: false,
+    usedCloudVision: false,
     modelSource,
     alternatives,
   };

@@ -60,7 +60,7 @@ export type ImageClassificationResult = {
   issueType: IssueType;
   confidence: number;
   reason: string;
-  usedOpenAi: boolean;
-  modelSource: "openai" | "local" | "heuristic";
+  usedCloudVision: boolean;
+  modelSource: "cohere" | "openai" | "local" | "heuristic";
   alternatives: Array<{ issueType: IssueType; confidence: number }>;
 };

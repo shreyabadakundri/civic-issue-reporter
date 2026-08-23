@@ -384,6 +384,9 @@ function ReportFlow({
                           {ISSUE_META[classification.issueType].label}
                         </Badge>
                         <span className="font-mono text-sm">{Math.round(classification.confidence * 100)}% confidence</span>
+                        {classification.modelSource === "cohere" && (
+                          <Badge variant="outline" className="border-violet-400/40 text-violet-300">Cohere Vision</Badge>
+                        )}
                         {classification.modelSource === "openai" && (
                           <Badge variant="outline" className="border-primary/40 text-primary">OpenAI Vision</Badge>
                         )}
