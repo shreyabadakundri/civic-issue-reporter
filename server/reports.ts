@@ -1,7 +1,11 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
-import { analyzeReport, classifyIssueFromImage } from "@/lib/ai";
+import {
+  analyzeReport,
+  classifyIssueFromDescription,
+  classifyIssueFromImage,
+} from "@/lib/ai";
 import { DEPARTMENTS, ISSUE_META, type Department, type IssueType, type ReportStatus } from "@/lib/constants";
 import {
   generateTicketId,
@@ -15,6 +19,14 @@ import {
   seedDemoReports,
   updateReportStatus,
 } from "@/lib/db";
+import { listEmailOutbox, notifyDepartmentsForReport } from "@/lib/email";
+import {
+  buildIssueBreakdown,
+  fuseModalityScores,
+  scoresFromClassification,
+  scoresFromDescription,
+  summarizeMultiIssue,
+} from "@/lib/multi-issue";
 import { ensureDemoPlaceholder, saveImageFromFile } from "@/lib/storage";
 import type { AnalysisResult, DepartmentQueue, ImageClassificationResult, PlatformStats, ReportRecord } from "@/lib/types";
 
@@ -28,37 +40,48 @@ const statusSchema = z.enum([
   "closed",
 ]);
 
-const submitReportFieldsSchema = z.object({
-  issueType: issueTypeSchema.optional(),
-  manualOverride: z
-    .union([z.literal("true"), z.literal("false"), z.boolean()])
-    .optional()
-    .transform((value) => value === true || value === "true"),
-  description: z
-    .string()
-    .trim()
-    .min(10, "Description must be at least 10 characters"),
-  lat: z.coerce.number(),
-  lng: z.coerce.number(),
-  locationLabel: z.string().trim().min(3, "Location label is required"),
-});
+const submitReportFieldsSchema = z
+  .object({
+    issueType: issueTypeSchema.optional(),
+    manualOverride: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .optional()
+      .transform((value) => value === true || value === "true"),
+    description: z.string().trim(),
+    lat: z.coerce.number(),
+    lng: z.coerce.number(),
+    locationLabel: z.string().trim().min(3, "Location label is required"),
+    hasImage: z
+      .union([z.literal("true"), z.literal("false"), z.boolean()])
+      .optional()
+      .transform((value) => value === true || value === "true"),
+  })
+  .superRefine((data, ctx) => {
+    const hasImage = data.hasImage;
+    const hasDescription = data.description.length >= 10;
+    if (!hasImage && !hasDescription) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Provide a photo or a description (at least 10 characters).",
+        path: ["description"],
+      });
+    }
+  });
 
 async function fileToBase64(file: File) {
   const buffer = Buffer.from(await file.arrayBuffer());
   return buffer.toString("base64");
 }
 
-function parseImageFromFormData(data: FormData) {
+function parseOptionalImage(data: FormData) {
   const image = data.get("image");
-  if (!(image instanceof File) || image.size === 0) {
-    throw new Error("Image upload is required");
-  }
+  if (!(image instanceof File) || image.size === 0) return null;
   return image;
 }
 
-function bootstrapDb() {
+async function bootstrapDb() {
   ensureDemoPlaceholder();
-  seedDemoReports();
+  await seedDemoReports();
 }
 
 function toAnalysisResult(report: ReportRecord): AnalysisResult {
@@ -77,18 +100,21 @@ function toAnalysisResult(report: ReportRecord): AnalysisResult {
     },
     status: report.status,
     imageUrl: report.imagePath,
+    isMultiIssue: report.isMultiIssue,
+    issueBreakdown: report.issueBreakdown,
+    notifiedDepartments: report.notifiedDepartments,
   };
 }
 
 export const getStats = createServerFn({ method: "GET" }).handler(async (): Promise<PlatformStats> => {
-  bootstrapDb();
+  await bootstrapDb();
   return getPlatformStats();
 });
 
 export const getQueues = createServerFn({ method: "GET" }).handler(async () => {
-  bootstrapDb();
-  const counts = getDepartmentQueueCounts();
-  const manualReview = getManualReviewReports(10);
+  await bootstrapDb();
+  const counts = await getDepartmentQueueCounts();
+  const manualReview = await getManualReviewReports(10);
 
   const departments: DepartmentQueue[] = DEPARTMENTS.map((department) => ({
     department,
@@ -99,10 +125,16 @@ export const getQueues = createServerFn({ method: "GET" }).handler(async () => {
   return { departments, manualReview: manualReview.map(toAnalysisResult) };
 });
 
+export const getEmailOutbox = createServerFn({ method: "GET" }).handler(async () => {
+  await bootstrapDb();
+  return listEmailOutbox(50);
+});
+
 export const classifyReportImage = createServerFn({ method: "POST" })
   .validator((formData: FormData) => formData)
   .handler(async ({ data }): Promise<ImageClassificationResult> => {
-    const image = parseImageFromFormData(data);
+    const image = parseOptionalImage(data);
+    if (!image) throw new Error("Image is required for photo classification");
     const description = data.get("description");
     const imageBase64 = await fileToBase64(image);
 
@@ -114,19 +146,28 @@ export const classifyReportImage = createServerFn({ method: "POST" })
     });
   });
 
+export const classifyReportDescription = createServerFn({ method: "POST" })
+  .validator((data: { description: string }) =>
+    z.object({ description: z.string().trim().min(10) }).parse(data),
+  )
+  .handler(async ({ data }): Promise<ImageClassificationResult> => {
+    return classifyIssueFromDescription(data.description);
+  });
+
 export const submitReport = createServerFn({ method: "POST" })
   .validator((formData: FormData) => formData)
   .handler(async ({ data }): Promise<AnalysisResult> => {
-    bootstrapDb();
+    await bootstrapDb();
 
-    const image = parseImageFromFormData(data);
+    const image = parseOptionalImage(data);
     const parsed = submitReportFieldsSchema.safeParse({
       issueType: data.get("issueType") || undefined,
       manualOverride: data.get("manualOverride") || undefined,
-      description: data.get("description"),
+      description: data.get("description") ?? "",
       lat: data.get("lat"),
       lng: data.get("lng"),
       locationLabel: data.get("locationLabel"),
+      hasImage: Boolean(image),
     });
 
     if (!parsed.success) {
@@ -134,36 +175,70 @@ export const submitReport = createServerFn({ method: "POST" })
     }
 
     const { description, lat, lng, locationLabel, manualOverride } = parsed.data;
-    const imageBase64 = await fileToBase64(image);
-    const classification = await classifyIssueFromImage({
-      imageBase64,
-      mimeType: image.type || "image/jpeg",
-      fileName: image.name,
-      description,
-    });
 
-    const issueType =
-      manualOverride && parsed.data.issueType ? parsed.data.issueType : classification.issueType;
+    let classification: ImageClassificationResult;
+    if (image) {
+      const imageBase64 = await fileToBase64(image);
+      classification = await classifyIssueFromImage({
+        imageBase64,
+        mimeType: image.type || "image/jpeg",
+        fileName: image.name,
+        description: description || undefined,
+      });
+    } else {
+      classification = classifyIssueFromDescription(description);
+    }
+
+    const visionScores = image ? scoresFromClassification(classification) : null;
+    const nlpScores = description.trim() ? scoresFromDescription(description) : null;
+    const fused = fuseModalityScores({ vision: visionScores, nlp: nlpScores });
+    let breakdown = buildIssueBreakdown(fused);
+
+    if (manualOverride && parsed.data.issueType) {
+      const chosen = parsed.data.issueType;
+      breakdown = breakdown.map((item) =>
+        item.issueType === chosen
+          ? { ...item, confidence: Math.max(item.confidence, 0.72), percentage: Math.max(item.percentage, 72) }
+          : item,
+      );
+      breakdown.sort((a, b) => b.confidence - a.confidence);
+    }
+
+    const summary = summarizeMultiIssue(breakdown);
+    const issueType = manualOverride && parsed.data.issueType ? parsed.data.issueType : summary.primaryIssueType;
 
     const started = Date.now();
-    const imagePath = await saveImageFromFile(image);
+    const imagePath = image
+      ? await saveImageFromFile(image)
+      : "/uploads/demo-placeholder.jpg";
+
     const analysis = await analyzeReport({
       issueType,
-      description,
-      imageSizeBytes: image.size,
-      imageMimeType: image.type || "image/jpeg",
-      visionConfidence: classification.confidence,
+      description: description || "(Photo-only report — no written description)",
+      imageSizeBytes: image?.size ?? 0,
+      imageMimeType: image?.type || "text/plain",
+      visionConfidence: breakdown.find((b) => b.issueType === issueType)?.confidence ?? classification.confidence,
       classificationReason: classification.reason,
       usedCloudVision: classification.usedCloudVision,
     });
 
-    const status: ReportStatus = analysis.routed ? "routed" : "manual_review";
-    const id = generateTicketId();
+    const status: ReportStatus = summary.routed ? "routed" : "manual_review";
+    const id = await generateTicketId();
 
-    const report = insertReport({
+    const departmentsToNotify = summary.isMultiIssue
+      ? summary.departments
+      : [ISSUE_META[issueType].department as Department];
+
+    const statusNote = summary.isMultiIssue
+      ? `Multi-issue alert: ${summary.activeBreakdown.map((b) => `${ISSUE_META[b.issueType].label} ${b.percentage}%`).join(", ")}`
+      : summary.routed
+        ? `Auto-routed to ${ISSUE_META[issueType].department} (${Math.round(analysis.final * 100)}% confidence)`
+        : `Queued for manual review (${Math.round(analysis.final * 100)}% confidence)`;
+
+    const report = await insertReport({
       id,
       issueType,
-      description,
+      description: description || "(Photo-only submission)",
       imagePath,
       lat,
       lng,
@@ -171,25 +246,42 @@ export const submitReport = createServerFn({ method: "POST" })
       visionScore: analysis.vision,
       nlpScore: analysis.nlp,
       finalScore: analysis.final,
-      routed: analysis.routed,
-      department: analysis.department as Department,
+      routed: summary.routed,
+      department: ISSUE_META[issueType].department as Department,
       status,
-      statusNote: analysis.routed
-        ? `Auto-routed to ${analysis.department} (${Math.round(analysis.final * 100)}% confidence)`
-        : `Queued for manual review (${Math.round(analysis.final * 100)}% confidence)`,
+      statusNote,
+      isMultiIssue: summary.isMultiIssue,
+      issueBreakdown: summary.activeBreakdown,
+      notifiedDepartments: departmentsToNotify,
     });
 
-    console.info(`Report ${id} analyzed in ${Date.now() - started}ms`, analysis.details);
-    return toAnalysisResult(report);
+    const emails = await notifyDepartmentsForReport({
+      reportId: id,
+      locationLabel,
+      description: description || "(Photo-only submission)",
+      breakdown: summary.activeBreakdown,
+      departments: departmentsToNotify,
+    });
+
+    console.info(`Report ${id} analyzed in ${Date.now() - started}ms`, {
+      multi: summary.isMultiIssue,
+      departments: departmentsToNotify,
+      emails: emails.length,
+    });
+
+    return {
+      ...toAnalysisResult(report),
+      emailsSent: emails.length,
+    };
   });
 
 export const fetchReport = createServerFn({ method: "GET" })
   .validator((data: { id: string }) => z.object({ id: z.string() }).parse(data))
   .handler(async ({ data }) => {
-    bootstrapDb();
-    const report = getReportById(data.id);
+    await bootstrapDb();
+    const report = await getReportById(data.id);
     if (!report) throw new Error("Report not found");
-    const history = getStatusHistory(data.id);
+    const history = await getStatusHistory(data.id);
     return { report, history };
   });
 
@@ -204,7 +296,7 @@ export const fetchReports = createServerFn({ method: "GET" })
       .parse(data),
   )
   .handler(async ({ data }) => {
-    bootstrapDb();
+    await bootstrapDb();
     return listReports(data);
   });
 
@@ -219,16 +311,16 @@ export const changeReportStatus = createServerFn({ method: "POST" })
       .parse(data),
   )
   .handler(async ({ data }) => {
-    bootstrapDb();
-    const updated = updateReportStatus(data.id, data.status, data.note);
+    await bootstrapDb();
+    const updated = await updateReportStatus(data.id, data.status, data.note);
     if (!updated) throw new Error("Report not found");
     return updated;
   });
 
 export const getDashboardSummary = createServerFn({ method: "GET" }).handler(async () => {
-  bootstrapDb();
-  const stats = getPlatformStats();
-  const all = listReports({ limit: 200 });
+  await bootstrapDb();
+  const stats = await getPlatformStats();
+  const all = await listReports({ limit: 200 });
   const byStatus = statusSchema.options.reduce(
     (acc, status) => {
       acc[status] = all.filter((r) => r.status === status).length;
@@ -239,7 +331,9 @@ export const getDashboardSummary = createServerFn({ method: "GET" }).handler(asy
 
   const byDepartment = DEPARTMENTS.reduce(
     (acc, dept) => {
-      acc[dept] = all.filter((r) => r.department === dept).length;
+      acc[dept] = all.filter(
+        (r) => r.department === dept || r.notifiedDepartments?.includes(dept),
+      ).length;
       return acc;
     },
     {} as Record<Department, number>,
