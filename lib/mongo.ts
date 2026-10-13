@@ -1,40 +1,61 @@
-import { MongoClient, type Db } from "mongodb";
+import { MongoClient, ServerApiVersion, type Db } from "mongodb";
 
-import { loadEnvFile } from "./env";
-
-loadEnvFile();
+import "./env";
 
 let client: MongoClient | null = null;
 let db: Db | null = null;
-let mongoReachable: boolean | null = null;
+let mongoReachable = false;
 
-export function isMongoEnabled(): boolean {
-  return Boolean(process.env.MONGODB_URI?.trim());
+export function getMongoUri(): string | undefined {
+  return process.env.MONGODB_URL?.trim() || undefined;
 }
 
-/** True when MONGODB_URI is set and Atlas accepts the credentials (cached after first attempt). */
+export function isMongoEnabled(): boolean {
+  return Boolean(getMongoUri());
+}
+
+export function resetMongoConnection() {
+  mongoReachable = false;
+  db = null;
+  if (client) {
+    void client.close().catch(() => {});
+    client = null;
+  }
+}
+
+/** True when MONGODB_URL is set and Atlas accepts the credentials (cached after success). */
 export async function useMongo(): Promise<boolean> {
   if (!isMongoEnabled()) return false;
-  if (mongoReachable === false) return false;
-  if (mongoReachable === true) return true;
+  if (mongoReachable && db) return true;
 
   try {
     await getDb();
     mongoReachable = true;
     return true;
   } catch (err) {
-    mongoReachable = false;
-    if (client) {
-      await client.close().catch(() => {});
-      client = null;
-      db = null;
-    }
+    resetMongoConnection();
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(
-      `[mongo] Could not connect (${msg}). Using local data/store.json until MONGODB_URI is fixed.`,
+      `[mongo] Could not connect (${msg}). Using local data/store.json until MONGODB_URL is fixed.`,
     );
     return false;
   }
+}
+
+function mongoClientOptions() {
+  return {
+    serverApi: {
+      version: ServerApiVersion.v1,
+      strict: false,
+      deprecationErrors: false,
+    },
+    serverSelectionTimeoutMS: 25_000,
+    connectTimeoutMS: 25_000,
+    socketTimeoutMS: 45_000,
+    maxPoolSize: 10,
+    // Prefer IPv4 — helps on some college/corp networks with broken IPv6
+    family: 4 as const,
+  };
 }
 
 async function ensureIndexes(database: Db) {
@@ -45,14 +66,15 @@ async function ensureIndexes(database: Db) {
 }
 
 export async function getDb(): Promise<Db> {
-  const uri = process.env.MONGODB_URI?.trim();
+  const uri = getMongoUri();
   if (!uri) {
-    throw new Error("MONGODB_URI is not set");
+    throw new Error("MONGODB_URL is not set");
   }
 
   if (db) return db;
 
-  client = new MongoClient(uri);
+  resetMongoConnection();
+  client = new MongoClient(uri, mongoClientOptions());
   await client.connect();
   const name = process.env.MONGODB_DB_NAME?.trim() || "civicmind";
   db = client.db(name);
@@ -61,9 +83,5 @@ export async function getDb(): Promise<Db> {
 }
 
 export async function closeMongo(): Promise<void> {
-  if (client) {
-    await client.close();
-    client = null;
-    db = null;
-  }
+  resetMongoConnection();
 }

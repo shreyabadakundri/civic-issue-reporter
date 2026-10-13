@@ -1,0 +1,31 @@
+# Copy to civicmind.config and fill in values (civicmind.config is gitignored)
+
+# Login (set strong values in production)
+AUTH_SESSION_SECRET=change-me-long-random-string
+AUTH_CITIZEN_USERNAME=citizen
+AUTH_CITIZEN_PASSWORD=citizen123
+AUTH_ADMIN_USERNAME=admin
+AUTH_ADMIN_PASSWORD=admin123
+
+MONGODB_URL=
+MONGODB_DB_NAME=civicmind
+
+COHERE_API_KEY=
+COHERE_VISION_MODEL=command-a-vision-07-2025
+COHERE_NLP_MODEL=command-a-03-2025
+
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_VISION_MODEL=gpt-4o-mini
+
+DEPT_EMAIL_PUBLIC_WORKS=you+publicworks@gmail.com
+DEPT_EMAIL_SANITATION=you+sanitation@gmail.com
+DEPT_EMAIL_SEWER=you+sewer@gmail.com
+NOTIFY_EMAIL_ADMIN=you@gmail.com
+NOTIFY_EMAIL_FALLBACK=you@gmail.com
+
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=you@gmail.com
+SMTP_PASS=
+SMTP_FROM=you@gmail.com

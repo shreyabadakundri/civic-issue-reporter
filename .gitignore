@@ -13,6 +13,8 @@ ml/dataset/**/*
 .env
 .env.*
 !.env.example
+env/local.env
+env/civicmind.config
 
 ml/raw/
 ml/**/__pycache__/

@@ -15,7 +15,7 @@ type Store = {
 
 async function main() {
   if (!isMongoEnabled()) {
-    console.error("Set MONGODB_URI in .env before migrating.");
+    console.error("Set MONGODB_URL in .env before migrating.");
     process.exit(1);
   }
 

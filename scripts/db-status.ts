@@ -23,7 +23,7 @@ async function main() {
   console.log(`  reports: ${localReports}, statusHistory: ${localHistory}`);
 
   if (!isMongoEnabled()) {
-    console.log("\nAtlas: MONGODB_URI not set — app uses local file only.");
+    console.log("\nAtlas: MONGODB_URL not set — app uses local file only.");
     return;
   }
 
@@ -40,7 +40,16 @@ async function main() {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.log("\nAtlas: could not connect —", msg);
-    console.log("→ Fix password (.env) and Network Access, then restart npm run dev");
+    if (msg.includes("SSL") || msg.includes("tlsv1 alert")) {
+      console.log("\nThis is usually NETWORK/DNS, not a wrong password:");
+      console.log("  • Atlas → Network Access → add your IP (or 0.0.0.0/0 for dev)");
+      console.log("  • Try phone hotspot or home Wi‑Fi (college/corp Wi‑Fi often blocks MongoDB)");
+      console.log("  • Windows: set DNS to 8.8.8.8 or 1.1.1.1, then retry");
+    } else if (msg.includes("bad auth")) {
+      console.log("\n→ Database Access password must match MONGODB_URL in env/civicmind.config");
+    } else {
+      console.log("→ Check MONGODB_URL, Atlas Network Access, and internet, then restart npm run dev");
+    }
     if (localReports > 0) {
       console.log("→ Your reports exist locally until migration succeeds.");
     }

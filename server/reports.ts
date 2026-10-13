@@ -1,6 +1,14 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
+import { buildAdminAnalytics } from "@/lib/admin-analytics";
+import {
+  assertRole,
+  authenticateUser,
+  createSessionToken,
+  parseSessionToken,
+} from "@/lib/auth";
+
 import {
   analyzeReport,
   classifyIssueFromDescription,
@@ -16,6 +24,7 @@ import {
   getStatusHistory,
   insertReport,
   listReports,
+  routeManualReviewReport,
   seedDemoReports,
   updateReportStatus,
 } from "@/lib/db";
@@ -23,6 +32,7 @@ import { listEmailOutbox, notifyDepartmentsForReport } from "@/lib/email";
 import {
   buildIssueBreakdown,
   fuseModalityScores,
+  normalizeActiveBreakdownPercentages,
   scoresFromClassification,
   scoresFromDescription,
   summarizeMultiIssue,
@@ -125,10 +135,46 @@ export const getQueues = createServerFn({ method: "GET" }).handler(async () => {
   return { departments, manualReview: manualReview.map(toAnalysisResult) };
 });
 
-export const getEmailOutbox = createServerFn({ method: "GET" }).handler(async () => {
-  await bootstrapDb();
-  return listEmailOutbox(50);
-});
+export const authLogin = createServerFn({ method: "POST" })
+  .validator((data: { username: string; password: string }) =>
+    z.object({ username: z.string().min(1), password: z.string().min(1) }).parse(data),
+  )
+  .handler(async ({ data }) => {
+    const role = authenticateUser(data.username, data.password);
+    if (!role) throw new Error("Invalid username or password");
+    const username = data.username.trim();
+    return {
+      token: createSessionToken(role, username),
+      role,
+      username,
+    };
+  });
+
+export const verifyAuthSession = createServerFn({ method: "GET" })
+  .validator((data: { token: string }) => z.object({ token: z.string() }).parse(data))
+  .handler(async ({ data }) => {
+    const session = parseSessionToken(data.token);
+    if (!session) return { ok: false as const };
+    return { ok: true as const, role: session.role, username: session.username };
+  });
+
+export const getEmailOutbox = createServerFn({ method: "GET" })
+  .validator((data: { authToken: string }) => z.object({ authToken: z.string() }).parse(data))
+  .handler(async ({ data }) => {
+    assertRole(data.authToken, "admin");
+    await bootstrapDb();
+    return listEmailOutbox(50);
+  });
+
+export const getAdminAnalytics = createServerFn({ method: "GET" })
+  .validator((data: { authToken: string }) => z.object({ authToken: z.string() }).parse(data))
+  .handler(async ({ data }) => {
+    assertRole(data.authToken, "admin");
+    await bootstrapDb();
+    const stats = await getPlatformStats();
+    const all = await listReports({ limit: 500 });
+    return buildAdminAnalytics(all, stats);
+  });
 
 export const classifyReportImage = createServerFn({ method: "POST" })
   .validator((formData: FormData) => formData)
@@ -175,6 +221,7 @@ export const submitReport = createServerFn({ method: "POST" })
     }
 
     const { description, lat, lng, locationLabel, manualOverride } = parsed.data;
+    const hasDescription = description.trim().length >= 10;
 
     let classification: ImageClassificationResult;
     if (image) {
@@ -183,14 +230,14 @@ export const submitReport = createServerFn({ method: "POST" })
         imageBase64,
         mimeType: image.type || "image/jpeg",
         fileName: image.name,
-        description: description || undefined,
+        description: hasDescription ? description.trim() : undefined,
       });
     } else {
       classification = classifyIssueFromDescription(description);
     }
 
     const visionScores = image ? scoresFromClassification(classification) : null;
-    const nlpScores = description.trim() ? scoresFromDescription(description) : null;
+    const nlpScores = hasDescription ? scoresFromDescription(description.trim()) : null;
     const fused = fuseModalityScores({ vision: visionScores, nlp: nlpScores });
     let breakdown = buildIssueBreakdown(fused);
 
@@ -205,6 +252,7 @@ export const submitReport = createServerFn({ method: "POST" })
     }
 
     const summary = summarizeMultiIssue(breakdown);
+    const activeBreakdown = normalizeActiveBreakdownPercentages(summary.activeBreakdown);
     const issueType = manualOverride && parsed.data.issueType ? parsed.data.issueType : summary.primaryIssueType;
 
     const started = Date.now();
@@ -212,25 +260,38 @@ export const submitReport = createServerFn({ method: "POST" })
       ? await saveImageFromFile(image)
       : "/uploads/demo-placeholder.jpg";
 
+    const visionForAnalysis = summary.isMultiIssue
+      ? Math.max(...activeBreakdown.map((b) => b.confidence), 0)
+      : (breakdown.find((b) => b.issueType === issueType)?.confidence ?? classification.confidence);
+
     const analysis = await analyzeReport({
       issueType,
-      description: description || "(Photo-only report — no written description)",
+      description: hasDescription ? description.trim() : "",
       imageSizeBytes: image?.size ?? 0,
       imageMimeType: image?.type || "text/plain",
-      visionConfidence: breakdown.find((b) => b.issueType === issueType)?.confidence ?? classification.confidence,
+      visionConfidence: visionForAnalysis,
       classificationReason: classification.reason,
       usedCloudVision: classification.usedCloudVision,
+      photoOnly: Boolean(image) && !hasDescription,
     });
 
     const status: ReportStatus = summary.routed ? "routed" : "manual_review";
     const id = await generateTicketId();
 
-    const departmentsToNotify = summary.isMultiIssue
-      ? summary.departments
-      : [ISSUE_META[issueType].department as Department];
+    const departmentsToNotify = summary.routed
+      ? summary.isMultiIssue
+        ? summary.departments
+        : [ISSUE_META[issueType].department as Department]
+      : [];
+
+    const mixLabel = activeBreakdown
+      .map((b) => `${ISSUE_META[b.issueType].label} ${b.percentage}%`)
+      .join(", ");
 
     const statusNote = summary.isMultiIssue
-      ? `Multi-issue alert: ${summary.activeBreakdown.map((b) => `${ISSUE_META[b.issueType].label} ${b.percentage}%`).join(", ")}`
+      ? summary.routed
+        ? `Multi-issue alert: ${mixLabel} → ${summary.departments.join(", ")}`
+        : `Manual review: ${mixLabel} — one or more issues below auto-route threshold`
       : summary.routed
         ? `Auto-routed to ${ISSUE_META[issueType].department} (${Math.round(analysis.final * 100)}% confidence)`
         : `Queued for manual review (${Math.round(analysis.final * 100)}% confidence)`;
@@ -245,23 +306,28 @@ export const submitReport = createServerFn({ method: "POST" })
       locationLabel,
       visionScore: analysis.vision,
       nlpScore: analysis.nlp,
-      finalScore: analysis.final,
+      finalScore: summary.isMultiIssue
+        ? Math.max(...activeBreakdown.map((b) => b.confidence), analysis.final)
+        : analysis.final,
       routed: summary.routed,
       department: ISSUE_META[issueType].department as Department,
       status,
       statusNote,
       isMultiIssue: summary.isMultiIssue,
-      issueBreakdown: summary.activeBreakdown,
+      issueBreakdown: activeBreakdown,
       notifiedDepartments: departmentsToNotify,
     });
 
-    const emails = await notifyDepartmentsForReport({
-      reportId: id,
-      locationLabel,
-      description: description || "(Photo-only submission)",
-      breakdown: summary.activeBreakdown,
-      departments: departmentsToNotify,
-    });
+    const emails =
+      departmentsToNotify.length > 0
+        ? await notifyDepartmentsForReport({
+            reportId: id,
+            locationLabel,
+            description: description || "(Photo-only submission)",
+            breakdown: activeBreakdown,
+            departments: departmentsToNotify,
+          })
+        : [];
 
     console.info(`Report ${id} analyzed in ${Date.now() - started}ms`, {
       multi: summary.isMultiIssue,
@@ -286,60 +352,107 @@ export const fetchReport = createServerFn({ method: "GET" })
   });
 
 export const fetchReports = createServerFn({ method: "GET" })
-  .validator((data: { status?: ReportStatus; department?: Department; limit?: number }) =>
-    z
-      .object({
-        status: statusSchema.optional(),
-        department: z.enum(DEPARTMENTS).optional(),
-        limit: z.number().optional(),
-      })
-      .parse(data),
+  .validator(
+    (data: {
+      status?: ReportStatus;
+      department?: Department;
+      limit?: number;
+      authToken?: string;
+    }) =>
+      z
+        .object({
+          status: statusSchema.optional(),
+          department: z.enum(DEPARTMENTS).optional(),
+          limit: z.number().optional(),
+          authToken: z.string().optional(),
+        })
+        .parse(data),
   )
   .handler(async ({ data }) => {
     await bootstrapDb();
+    const isDeptScoped = Boolean(data.department);
+    const isAdminList = !isDeptScoped && (data.limit ?? 0) > 50;
+    if (isAdminList || (data.status && !data.department)) {
+      assertRole(data.authToken, "admin");
+    }
     return listReports(data);
   });
 
 export const changeReportStatus = createServerFn({ method: "POST" })
-  .validator((data: { id: string; status: ReportStatus; note?: string }) =>
-    z
-      .object({
-        id: z.string(),
-        status: statusSchema,
-        note: z.string().optional(),
-      })
-      .parse(data),
+  .validator(
+    (data: { id: string; status: ReportStatus; note?: string; authToken?: string }) =>
+      z
+        .object({
+          id: z.string(),
+          status: statusSchema,
+          note: z.string().optional(),
+          authToken: z.string().optional(),
+        })
+        .parse(data),
   )
   .handler(async ({ data }) => {
+    if (data.note?.includes("by admin")) {
+      assertRole(data.authToken, "admin");
+    }
     await bootstrapDb();
     const updated = await updateReportStatus(data.id, data.status, data.note);
     if (!updated) throw new Error("Report not found");
     return updated;
   });
 
-export const getDashboardSummary = createServerFn({ method: "GET" }).handler(async () => {
-  await bootstrapDb();
-  const stats = await getPlatformStats();
-  const all = await listReports({ limit: 200 });
-  const byStatus = statusSchema.options.reduce(
-    (acc, status) => {
-      acc[status] = all.filter((r) => r.status === status).length;
-      return acc;
-    },
-    {} as Record<ReportStatus, number>,
-  );
+export const adminRouteManualReview = createServerFn({ method: "POST" })
+  .validator(
+    (data: {
+      id: string;
+      department: Department;
+      issueType?: IssueType;
+      note?: string;
+      authToken: string;
+    }) =>
+      z
+        .object({
+          id: z.string(),
+          department: z.enum(DEPARTMENTS),
+          issueType: issueTypeSchema.optional(),
+          note: z.string().max(500).optional(),
+          authToken: z.string(),
+        })
+        .parse(data),
+  )
+  .handler(async ({ data }) => {
+    assertRole(data.authToken, "admin");
+    await bootstrapDb();
+    const updated = await routeManualReviewReport(data.id, {
+      department: data.department,
+      issueType: data.issueType,
+      note: data.note,
+    });
+    if (!updated) {
+      throw new Error("Ticket not found or not in manual review");
+    }
 
-  const byDepartment = DEPARTMENTS.reduce(
-    (acc, dept) => {
-      acc[dept] = all.filter(
-        (r) => r.department === dept || r.notifiedDepartments?.includes(dept),
-      ).length;
-      return acc;
-    },
-    {} as Record<Department, number>,
-  );
+    const breakdown =
+      updated.issueBreakdown?.length
+        ? updated.issueBreakdown
+        : [
+            {
+              issueType: updated.issueType,
+              percentage: 100,
+              confidence: updated.finalScore,
+              department: updated.department,
+              routed: true,
+            },
+          ];
 
-  return { stats, byStatus, byDepartment, recent: all.slice(0, 10) };
-});
+    await notifyDepartmentsForReport({
+      reportId: updated.id,
+      locationLabel: updated.locationLabel,
+      description: updated.description,
+      breakdown,
+      departments: [updated.department],
+    });
+
+    return updated;
+  });
 
 export { ISSUE_META };

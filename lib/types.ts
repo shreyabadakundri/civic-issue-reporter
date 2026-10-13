@@ -22,6 +22,8 @@ export type ReportRecord = {
   routed: boolean;
   department: Department;
   status: ReportStatus;
+  /** Latest status history note (e.g. manual review reason). */
+  lastStatusNote?: string;
   isMultiIssue?: boolean;
   issueBreakdown?: IssueBreakdownItem[];
   notifiedDepartments?: Department[];

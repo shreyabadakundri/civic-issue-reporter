@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 
+import "./env";
 import { ISSUE_META } from "./constants";
 import type { Department } from "./constants";
 import type { EmailOutboxRecord, IssueBreakdownItem } from "./types";
@@ -91,19 +92,75 @@ export async function trySmtpSend(to: string, subject: string, html: string) {
 
   try {
     const nodemailer = await import("nodemailer");
-    const transport = nodemailer.createTransport({
-      host,
-      port,
-      secure: port === 465,
-      requireTLS: port === 587,
-      auth: { user, pass },
-    });
-    await transport.verify();
-    const info = await transport.sendMail({ from, to, subject, html });
-    return { ok: true as const, messageId: info.messageId };
+
+    async function sendWithTransport(
+      transport: import("nodemailer").Transporter,
+    ) {
+      await transport.verify();
+    const adminCopy =
+      process.env.NOTIFY_EMAIL_ADMIN?.trim() ||
+      process.env.NOTIFY_EMAIL_FALLBACK?.trim() ||
+      "";
+    const bcc =
+      adminCopy && adminCopy.toLowerCase() !== to.toLowerCase() ? adminCopy : undefined;
+
+      return transport.sendMail({ from, to, subject, html, bcc });
+    }
+
+    const attempts: import("nodemailer").Transporter[] = [];
+    if (host === "smtp.gmail.com") {
+      attempts.push(
+        nodemailer.createTransport({ service: "gmail", auth: { user, pass } }),
+      );
+      attempts.push(
+        nodemailer.createTransport({
+          host: "smtp.gmail.com",
+          port: 465,
+          secure: true,
+          auth: { user, pass },
+        }),
+      );
+      attempts.push(
+        nodemailer.createTransport({
+          host: "smtp.gmail.com",
+          port: 587,
+          secure: false,
+          requireTLS: true,
+          auth: { user, pass },
+        }),
+      );
+    } else {
+      attempts.push(
+        nodemailer.createTransport({
+          host,
+          port,
+          secure: port === 465,
+          requireTLS: port === 587,
+          auth: { user, pass },
+        }),
+      );
+    }
+
+    let lastError: unknown;
+    for (const transport of attempts) {
+      try {
+        const info = await sendWithTransport(transport);
+        return { ok: true as const, messageId: info.messageId };
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    throw lastError;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn("SMTP send failed:", message);
+    if (message.includes("535") || message.includes("BadCredentials")) {
+      console.warn(
+        "Gmail checklist: 2-Step Verification ON, App Password for THIS account, SMTP_USER matches, revoke old app password and create a new one.",
+      );
+      console.warn("Unlock captcha (if asked): https://accounts.google.com/DisplayUnlockCaptcha");
+    }
     return { ok: false as const, error: message };
   }
 }

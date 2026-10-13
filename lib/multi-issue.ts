@@ -8,10 +8,11 @@ import {
 import type { Department } from "./constants";
 import type { ImageClassificationResult, IssueBreakdownItem } from "./types";
 
-/** Minimum fused score to count as a distinct issue in the breakdown. */
-export const MULTI_ISSUE_MIN_CONFIDENCE = 0.32;
-/** Second issue must be at least this fraction of the top score to count as multi-issue. */
-export const MULTI_ISSUE_SECONDARY_RATIO = 0.55;
+/** Minimum fused score to auto-route a distinct issue (matches report UI hint). */
+export const MULTI_ISSUE_MIN_CONFIDENCE = 0.24;
+
+/** Minimum fused score to show / store as a visible issue candidate (aligns with report UI). */
+export const ISSUE_CANDIDATE_MIN_CONFIDENCE = 0.08;
 
 const ISSUE_TYPES: IssueType[] = ["pothole", "garbage", "manhole"];
 
@@ -125,6 +126,16 @@ export function buildIssueBreakdown(fused: Record<IssueType, number>): IssueBrea
     };
   }).sort((a, b) => b.confidence - a.confidence);
 
+  const candidates = items.filter((item) => item.confidence >= ISSUE_CANDIDATE_MIN_CONFIDENCE);
+  if (candidates.length >= 2) {
+    return items;
+  }
+
+  const activeTypes = items.filter((item) => item.confidence >= MULTI_ISSUE_MIN_CONFIDENCE);
+  if (activeTypes.length >= 2) {
+    return items;
+  }
+
   const top = items[0]?.confidence ?? 0;
   return items.filter(
     (item) => item.confidence >= MULTI_ISSUE_MIN_CONFIDENCE || item.confidence === top,
@@ -132,23 +143,52 @@ export function buildIssueBreakdown(fused: Record<IssueType, number>): IssueBrea
 }
 
 export function summarizeMultiIssue(breakdown: IssueBreakdownItem[]) {
-  const primary = breakdown[0];
-  const topConf = primary?.confidence ?? 0;
-  const active = breakdown.filter(
-    (item) =>
-      item.confidence >= MULTI_ISSUE_MIN_CONFIDENCE &&
-      (item.issueType === primary?.issueType ||
-        item.confidence >= topConf * MULTI_ISSUE_SECONDARY_RATIO),
-  );
-  const isMultiIssue = active.length >= 2;
-  const departments = [...new Set(active.map((item) => item.department))];
-  const routed = active.some((item) => item.routed);
+  const sorted = [...breakdown].sort((a, b) => b.confidence - a.confidence);
+  const primary = sorted[0];
+  const candidates = sorted.filter((item) => item.confidence >= ISSUE_CANDIDATE_MIN_CONFIDENCE);
+  const isMultiIssue = candidates.length >= 2;
+
+  const allCandidatesAutoRoutable =
+    isMultiIssue &&
+    candidates.every((item) => item.confidence >= MULTI_ISSUE_MIN_CONFIDENCE);
+
+  const routed = isMultiIssue
+    ? allCandidatesAutoRoutable
+    : (primary?.confidence ?? 0) >= ROUTING_THRESHOLD;
+
+  const departments =
+    isMultiIssue && routed
+      ? [...new Set(candidates.map((item) => item.department))]
+      : !isMultiIssue && routed && primary
+        ? [primary.department as Department]
+        : [];
+
+  const activeBreakdown = (isMultiIssue ? candidates : primary ? [primary] : []).map((item) => ({
+    ...item,
+    routed: routed && item.confidence >= MULTI_ISSUE_MIN_CONFIDENCE,
+  }));
 
   return {
     primaryIssueType: primary?.issueType ?? ("pothole" as IssueType),
     isMultiIssue,
     departments,
     routed,
-    activeBreakdown: active,
+    activeBreakdown,
+    belowThresholdForAutoRoute: isMultiIssue && !allCandidatesAutoRoutable,
   };
+}
+
+/** Re-normalize active issue shares to 100% for reports and emails. */
+export function normalizeActiveBreakdownPercentages(
+  breakdown: IssueBreakdownItem[],
+): IssueBreakdownItem[] {
+  const sum = breakdown.reduce((acc, item) => acc + item.confidence, 0) || 1;
+  return breakdown.map((item) => {
+    const share = item.confidence / sum;
+    return {
+      ...item,
+      confidence: share,
+      percentage: Math.round(share * 1000) / 10,
+    };
+  });
 }

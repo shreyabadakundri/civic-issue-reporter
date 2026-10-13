@@ -48,6 +48,17 @@ function mutateStore<T>(fn: (store: Store) => T): T {
   return result;
 }
 
+/** Mongo adds `_id`; strip it so TanStack server functions can serialize responses. */
+function fromMongoReport(doc: (ReportRecord & { _id?: unknown }) | null): ReportRecord | null {
+  if (!doc) return null;
+  const { _id: _ignored, ...report } = doc;
+  return report;
+}
+
+function fromMongoReports(docs: (ReportRecord & { _id?: unknown })[]): ReportRecord[] {
+  return docs.map((doc) => fromMongoReport(doc)!);
+}
+
 async function nextHistoryIdMongo(): Promise<number> {
   const db = await getDb();
   const result = await db.collection<{ _id: string; seq: number }>("counters").findOneAndUpdate(
@@ -114,6 +125,7 @@ export async function insertReport(input: {
       routed: input.routed,
       department: input.department,
       status: input.status,
+      lastStatusNote: input.statusNote,
       isMultiIssue: input.isMultiIssue,
       issueBreakdown: input.issueBreakdown,
       notifiedDepartments: input.notifiedDepartments,
@@ -150,6 +162,7 @@ export async function insertReport(input: {
       routed: input.routed,
       department: input.department,
       status: input.status,
+      lastStatusNote: input.statusNote,
       isMultiIssue: input.isMultiIssue,
       issueBreakdown: input.issueBreakdown,
       notifiedDepartments: input.notifiedDepartments,
@@ -204,7 +217,8 @@ export async function addStatusHistory(
 export async function getReportById(id: string): Promise<ReportRecord | null> {
   if (await useMongo()) {
     const db = await getDb();
-    return db.collection<ReportRecord>("reports").findOne({ id });
+    const doc = await db.collection<ReportRecord>("reports").findOne({ id });
+    return fromMongoReport(doc);
   }
   return readStore().reports.find((report) => report.id === id) ?? null;
 }
@@ -212,11 +226,12 @@ export async function getReportById(id: string): Promise<ReportRecord | null> {
 export async function getStatusHistory(reportId: string): Promise<StatusHistoryRecord[]> {
   if (await useMongo()) {
     const db = await getDb();
-    return db
-      .collection<StatusHistoryRecord>("statusHistory")
+    const docs = await db
+      .collection<StatusHistoryRecord & { _id?: unknown }>("statusHistory")
       .find({ reportId })
       .sort({ createdAt: 1 })
       .toArray();
+    return docs.map(({ _id: _ignored, ...entry }) => entry);
   }
   return readStore()
     .statusHistory.filter((entry) => entry.reportId === reportId)
@@ -239,12 +254,13 @@ export async function listReports(filters?: {
       ];
     }
     const limit = filters?.limit ?? 100;
-    return db
+    const docs = await db
       .collection<ReportRecord>("reports")
       .find(query)
       .sort({ createdAt: -1 })
       .limit(limit)
       .toArray();
+    return fromMongoReports(docs);
   }
 
   let reports = readStore().reports;
@@ -264,6 +280,92 @@ export async function listReports(filters?: {
   return reports.slice(0, filters?.limit ?? 100);
 }
 
+export async function routeManualReviewReport(
+  id: string,
+  input: {
+    department: Department;
+    issueType?: IssueType;
+    note?: string;
+  },
+): Promise<ReportRecord | null> {
+  const updatedAt = new Date().toISOString();
+  const historyNote = input.note?.trim()
+    ? `Admin routed to ${input.department}: ${input.note.trim()}`
+    : `Admin routed to ${input.department} after manual review`;
+
+  const buildBreakdown = (report: ReportRecord, issueType: IssueType): ReportRecord["issueBreakdown"] => [
+    {
+      issueType,
+      percentage: 100,
+      confidence: report.finalScore,
+      department: input.department,
+      routed: true,
+    },
+  ];
+
+  if (await useMongo()) {
+    const db = await getDb();
+    const existing = await db.collection<ReportRecord>("reports").findOne({ id });
+    if (!existing || existing.status !== "manual_review") return null;
+
+    const issueType = input.issueType ?? existing.issueType;
+    const report = await db.collection<ReportRecord>("reports").findOneAndUpdate(
+      { id, status: "manual_review" },
+      {
+        $set: {
+          department: input.department,
+          issueType,
+          status: "routed",
+          routed: true,
+          isMultiIssue: false,
+          issueBreakdown: buildBreakdown(existing, issueType),
+          notifiedDepartments: [input.department],
+          updatedAt,
+        },
+      },
+      { returnDocument: "after" },
+    );
+    const cleaned = fromMongoReport(report);
+    if (!cleaned) return null;
+
+    const historyId = await nextHistoryIdMongo();
+    await db.collection("statusHistory").insertOne({
+      id: historyId,
+      reportId: id,
+      status: "routed",
+      note: historyNote,
+      createdAt: updatedAt,
+    });
+
+    return cleaned;
+  }
+
+  return mutateStore((store) => {
+    const report = store.reports.find((item) => item.id === id);
+    if (!report || report.status !== "manual_review") return null;
+
+    const issueType = input.issueType ?? report.issueType;
+    report.department = input.department;
+    report.issueType = issueType;
+    report.status = "routed";
+    report.routed = true;
+    report.isMultiIssue = false;
+    report.issueBreakdown = buildBreakdown(report, issueType);
+    report.notifiedDepartments = [input.department];
+    report.updatedAt = updatedAt;
+
+    store.statusHistory.push({
+      id: store.nextHistoryId++,
+      reportId: id,
+      status: "routed",
+      note: historyNote,
+      createdAt: updatedAt,
+    });
+
+    return { ...report };
+  });
+}
+
 export async function updateReportStatus(
   id: string,
   status: ReportStatus,
@@ -277,7 +379,8 @@ export async function updateReportStatus(
       { $set: { status, updatedAt } },
       { returnDocument: "after" },
     );
-    if (!report) return null;
+    const cleaned = fromMongoReport(report);
+    if (!cleaned) return null;
 
     const historyId = await nextHistoryIdMongo();
     await db.collection("statusHistory").insertOne({
@@ -288,7 +391,7 @@ export async function updateReportStatus(
       createdAt: updatedAt,
     });
 
-    return report;
+    return cleaned;
   }
 
   return mutateStore((store) => {
@@ -312,7 +415,8 @@ export async function updateReportStatus(
 async function allReports(): Promise<ReportRecord[]> {
   if (await useMongo()) {
     const db = await getDb();
-    return db.collection<ReportRecord>("reports").find({}).toArray();
+    const docs = await db.collection<ReportRecord>("reports").find({}).toArray();
+    return fromMongoReports(docs);
   }
   return readStore().reports;
 }

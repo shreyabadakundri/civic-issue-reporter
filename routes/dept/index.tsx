@@ -4,6 +4,7 @@ import { ArrowLeft, Droplets, Siren, Trash2, Wrench } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
+import { AuthGate } from "@/components/civic/auth-gate";
 import { SiteNav } from "@/components/civic/site-nav";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -55,6 +56,7 @@ function DeptPage() {
   const DeptIcon = DEPT_ICONS[department];
 
   return (
+    <AuthGate allow={["admin"]}>
     <div className="min-h-screen text-foreground">
       <SiteNav variant="portal" />
       <main className="mx-auto max-w-7xl px-6 py-10 space-y-8">
@@ -154,5 +156,6 @@ function DeptPage() {
         </div>
       </main>
     </div>
+    </AuthGate>
   );
 }

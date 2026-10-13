@@ -1,6 +1,7 @@
 import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { ArrowLeft, MapPin } from "lucide-react";
 
+import { AuthGate } from "@/components/civic/auth-gate";
 import { SiteNav } from "@/components/civic/site-nav";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,9 +26,10 @@ function ReportDetailPage() {
   const meta = ISSUE_META[report.issueType];
 
   return (
-    <div className="min-h-screen text-foreground">
-      <SiteNav variant="portal" />
-      <main className="mx-auto max-w-5xl px-6 py-10 space-y-6">
+    <AuthGate allow={["citizen", "admin"]}>
+      <div className="min-h-screen text-foreground">
+        <SiteNav variant="portal" />
+        <main className="mx-auto max-w-5xl px-6 py-10 space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <Badge variant="outline" className="mb-3 border-primary/40 text-primary bg-primary/5">
@@ -97,8 +99,12 @@ function ReportDetailPage() {
             ))}
             <div className="rounded-lg bg-white/5 p-3 text-sm">
               {report.routed
-                ? "Auto-routed based on confidence threshold."
-                : "Sent to manual review queue due to low confidence."}
+                ? report.isMultiIssue
+                  ? "Auto-routed to all detected departments."
+                  : "Auto-routed based on confidence threshold."
+                : report.isMultiIssue
+                  ? "Queued for manual review — an admin will review the photo and route the correct department(s)."
+                  : "Sent to manual review queue due to low confidence."}
             </div>
           </Card>
         </div>
@@ -123,6 +129,7 @@ function ReportDetailPage() {
           </ol>
         </Card>
       </main>
-    </div>
+      </div>
+    </AuthGate>
   );
 }

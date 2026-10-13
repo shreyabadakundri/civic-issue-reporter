@@ -8,6 +8,8 @@ import {
   Scripts,
 } from "@tanstack/react-router";
 
+import { AuthProvider } from "@/hooks/use-auth";
+
 import appCss from "../styles.css?url";
 
 function NotFoundComponent() {
@@ -113,7 +115,9 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <Outlet />
+      <AuthProvider>
+        <Outlet />
+      </AuthProvider>
     </QueryClientProvider>
   );
 }

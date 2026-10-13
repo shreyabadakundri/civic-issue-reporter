@@ -17,6 +17,8 @@ export type AnalysisInput = {
   visionConfidence?: number;
   classificationReason?: string;
   usedCloudVision?: boolean;
+  /** Image submitted with no citizen description — scores come from vision only. */
+  photoOnly?: boolean;
 };
 
 export type ClassificationInput = {
@@ -44,7 +46,7 @@ export type AnalysisOutput = {
 const ISSUE_TYPES: IssueType[] = ["pothole", "garbage", "manhole"];
 
 const CLASSIFICATION_PROMPT =
-  'Classify this civic issue photo. Return JSON only: {"issueType":"pothole"|"garbage"|"manhole","confidence":0-1,"reason":"string","alternatives":[{"issueType":"...","confidence":0-1}]}. pothole = road hole/crack/asphalt damage; garbage = trash/waste/litter pile; manhole = sewer cover/drain/missing cover.';
+  'Analyze this civic photo for ALL visible issue types. The citizen may provide NO text — use the image only. Return JSON only: {"issueType":"pothole"|"garbage"|"manhole","confidence":0-1,"reason":"string","perClassScores":{"pothole":0-1,"garbage":0-1,"manhole":0-1},"alternatives":[{"issueType":"...","confidence":0-1}]}. Set perClassScores for each class (0 = not visible, higher = clearly present). If pothole, garbage, and manhole all appear, score all three meaningfully. pothole = road hole/crack/asphalt damage; garbage = trash/waste/litter pile; manhole = sewer cover/drain/missing cover.';
 
 function clamp(value: number, min = 0.15, max = 0.99) {
   return Math.max(min, Math.min(max, value));
@@ -71,6 +73,32 @@ function normalizeIssueType(value: unknown): IssueType | null {
   return ISSUE_TYPES.includes(normalized as IssueType) ? (normalized as IssueType) : null;
 }
 
+function normalizePerClassScores(
+  raw: Record<string, unknown> | undefined,
+  primary: IssueType,
+  primaryConfidence: number,
+  alternatives: Array<{ issueType: IssueType; confidence: number }>,
+): Record<IssueType, number> {
+  const scores: Record<IssueType, number> = { pothole: 0.02, garbage: 0.02, manhole: 0.02 };
+
+  if (raw && typeof raw === "object") {
+    for (const issueType of ISSUE_TYPES) {
+      const value = raw[issueType];
+      if (typeof value === "number" && Number.isFinite(value)) {
+        scores[issueType] = Math.max(0, value);
+      }
+    }
+  }
+
+  scores[primary] = Math.max(scores[primary], primaryConfidence);
+  for (const alt of alternatives) {
+    scores[alt.issueType] = Math.max(scores[alt.issueType], alt.confidence);
+  }
+
+  const sum = ISSUE_TYPES.reduce((acc, t) => acc + scores[t], 0) || 1;
+  return Object.fromEntries(ISSUE_TYPES.map((t) => [t, scores[t] / sum])) as Record<IssueType, number>;
+}
+
 function parseClassificationPayload(
   content: string,
   modelSource: ImageClassificationResult["modelSource"],
@@ -81,11 +109,14 @@ function parseClassificationPayload(
       issueType?: string;
       confidence?: number;
       reason?: string;
+      perClassScores?: Record<string, number>;
       alternatives?: Array<{ issueType?: string; confidence?: number }>;
     };
 
     const issueType = normalizeIssueType(parsed.issueType);
     if (!issueType) return null;
+
+    const confidence = clamp(Number(parsed.confidence) || 0.75);
 
     const alternatives = (parsed.alternatives ?? [])
       .map((item) => {
@@ -94,15 +125,28 @@ function parseClassificationPayload(
         return { issueType: type, confidence: clamp(Number(item.confidence) || 0.2, 0.1, 0.95) };
       })
       .filter((item): item is { issueType: IssueType; confidence: number } => item !== null)
-      .slice(0, 2);
+      .slice(0, 3);
+
+    const perClassScores = normalizePerClassScores(
+      parsed.perClassScores,
+      issueType,
+      confidence,
+      alternatives,
+    );
+
+    const ranked = ISSUE_TYPES.map((type) => ({ issueType: type, confidence: perClassScores[type] })).sort(
+      (a, b) => b.confidence - a.confidence,
+    );
+    const top = ranked[0];
 
     return {
-      issueType,
-      confidence: clamp(Number(parsed.confidence) || 0.75),
+      issueType: top.issueType,
+      confidence: clamp(top.confidence),
       reason: parsed.reason ?? reasonFallback,
       usedCloudVision: true,
       modelSource,
-      alternatives,
+      alternatives: ranked.slice(1),
+      perClassScores,
     };
   } catch {
     return null;
@@ -180,14 +224,14 @@ async function classifyWithOpenAi(input: ClassificationInput): Promise<ImageClas
           {
             role: "system",
             content:
-              'Classify civic issue photos. Return JSON: {"issueType":"pothole"|"garbage"|"manhole","confidence":0-1,"reason":"string","alternatives":[{"issueType":"...","confidence":0-1}]}',
+              'Classify civic issue photos. Return JSON: {"issueType":"pothole"|"garbage"|"manhole","confidence":0-1,"reason":"string","perClassScores":{"pothole":0-1,"garbage":0-1,"manhole":0-1},"alternatives":[{"issueType":"...","confidence":0-1}]}. Score every visible issue in perClassScores.',
           },
           {
             role: "user",
             content: [
               {
                 type: "text",
-                text: "Classify this photo: pothole = road hole/crack/asphalt damage; garbage = trash/waste/litter pile; manhole = sewer cover/drain/missing cover.",
+                text: "List ALL visible issues in perClassScores. pothole = road hole/crack/asphalt damage; garbage = trash/waste/litter pile; manhole = sewer cover/drain/missing cover.",
               },
               {
                 type: "image_url",
@@ -228,6 +272,11 @@ function classifyHeuristic(input: ClassificationInput): ImageClassificationResul
     ? clamp(0.52 + top.score * 0.35 - (second?.score ?? 0) * 0.1)
     : 0.35;
 
+  const sum = scores.reduce((acc, item) => acc + item.score, 0) || 1;
+  const perClassScores = Object.fromEntries(
+    scores.map((item) => [item.issueType, item.score / sum]),
+  ) as Record<IssueType, number>;
+
   return {
     issueType: top.issueType,
     confidence,
@@ -240,6 +289,7 @@ function classifyHeuristic(input: ClassificationInput): ImageClassificationResul
       issueType: item.issueType,
       confidence: clamp(item.score * 0.5 + 0.15),
     })),
+    perClassScores,
   };
 }
 
@@ -360,10 +410,25 @@ async function buildNlpScoreWithCohere(
 export async function analyzeReport(input: AnalysisInput): Promise<AnalysisOutput> {
   const meta = ISSUE_META[input.issueType];
   const vision = clamp(input.visionConfidence ?? meta.baseVision);
+  const photoOnly = input.photoOnly || !input.description.trim();
 
-  const cohereNlp = await buildNlpScoreWithCohere(input.issueType, input.description);
-  const nlp = cohereNlp?.score ?? buildNlpScoreHeuristic(input.issueType, input.description);
-  const final = vision * VISION_WEIGHT + nlp * NLP_WEIGHT;
+  let nlp: number;
+  let nlpSignals: string[];
+  if (photoOnly) {
+    nlp = vision;
+    nlpSignals = ["No description — vision-only analysis"];
+  } else {
+    const cohereNlp = await buildNlpScoreWithCohere(input.issueType, input.description);
+    nlp = cohereNlp?.score ?? buildNlpScoreHeuristic(input.issueType, input.description);
+    nlpSignals = cohereNlp?.signals ?? [
+      `${Math.round(keywordScore(input.description, meta.keywords) * 100)}% keyword alignment with ${meta.label}`,
+      input.description.trim().split(/\s+/).length >= 8
+        ? "Detailed citizen description"
+        : "Short description",
+    ];
+  }
+
+  const final = photoOnly ? vision : vision * VISION_WEIGHT + nlp * NLP_WEIGHT;
 
   const visionSignals = input.classificationReason
     ? [input.classificationReason, `Vision confidence ${Math.round(vision * 100)}%`]
@@ -372,13 +437,6 @@ export async function analyzeReport(input: AnalysisInput): Promise<AnalysisOutpu
         input.imageSizeBytes > 10_000 ? "Sufficient image payload" : "Low-resolution image",
         `Classified as ${meta.label}`,
       ];
-
-  const nlpSignals = cohereNlp?.signals ?? [
-    `${Math.round(keywordScore(input.description, meta.keywords) * 100)}% keyword alignment with ${meta.label}`,
-    input.description.trim().split(/\s+/).length >= 8
-      ? "Detailed citizen description"
-      : "Short description",
-  ];
 
   return {
     vision,
