@@ -20,7 +20,13 @@ import { SiteNav } from "@/components/civic/site-nav";
 import { useLocalClassifier } from "@/hooks/use-local-classifier";
 import { ISSUE_META, type IssueType } from "@/lib/constants";
 import type { AnalysisResult, ImageClassificationResult } from "@/lib/types";
-import { classifyReportImage, getQueues, getStats, submitReport } from "@/server/reports";
+import {
+  classifyReportDescription,
+  classifyReportImage,
+  getQueues,
+  getStats,
+  submitReport,
+} from "@/server/reports";
 
 export const Route = createFileRoute("/")({
   component: Index,
@@ -171,6 +177,7 @@ function ReportFlow({
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [classifying, setClassifying] = useState(false);
+  const [classifyingText, setClassifyingText] = useState(false);
   const [classification, setClassification] = useState<ImageClassificationResult | null>(null);
   const [manualOverride, setManualOverride] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -214,35 +221,92 @@ function ReportFlow({
     setIssueType("");
     setManualOverride(false);
 
-    try {
-      if (localClassifier.ready) {
-        const localResult = await localClassifier.classify(file);
-        if (localResult) {
-          setClassification(localResult);
-          setIssueType(localResult.issueType);
-          toast.success(`Auto-confirmed: ${ISSUE_META[localResult.issueType].label}`, {
-            description: `${Math.round(localResult.confidence * 100)}% · Local trained model`,
-          });
-          return;
-        }
-      }
+    const applyResult = (result: ImageClassificationResult, sourceLabel: string) => {
+      setClassification(result);
+      setIssueType(result.issueType);
+      toast.success(`Auto-confirmed: ${ISSUE_META[result.issueType].label}`, {
+        description: `${Math.round(result.confidence * 100)}% · ${sourceLabel}`,
+      });
+    };
 
+    try {
       const formData = new FormData();
       formData.set("image", file);
       if (desc?.trim()) formData.set("description", desc.trim());
 
-      const result = await classifyReportImage({ data: formData });
-      setClassification(result);
-      setIssueType(result.issueType);
-      toast.success(`Auto-confirmed: ${ISSUE_META[result.issueType].label}`, {
-        description: `${Math.round(result.confidence * 100)}% confidence · ${result.reason}`,
-      });
+      let serverResult: ImageClassificationResult | null = null;
+      try {
+        serverResult = await classifyReportImage({ data: formData });
+      } catch {
+        serverResult = null;
+      }
+
+      const cloud =
+        serverResult &&
+        (serverResult.modelSource === "cohere" || serverResult.modelSource === "openai");
+
+      if (cloud && serverResult) {
+        applyResult(
+          serverResult,
+          serverResult.modelSource === "cohere" ? "Cohere vision" : "OpenAI vision",
+        );
+        return;
+      }
+
+      if (localClassifier.ready) {
+        const localResult = await localClassifier.classify(file);
+        if (localResult) {
+          const preferLocal =
+            !serverResult ||
+            serverResult.modelSource === "heuristic" ||
+            localResult.confidence > serverResult.confidence + 0.08;
+          if (preferLocal) {
+            applyResult(localResult, "Local trained model (browser)");
+            return;
+          }
+        }
+      }
+
+      if (serverResult) {
+        applyResult(serverResult, serverResult.reason);
+        return;
+      }
+
+      toast.error("Could not classify image — add COHERE_API_KEY or retrain the local model");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Could not classify image");
     } finally {
       setClassifying(false);
     }
   };
+
+  const classifyDescription = async (desc: string) => {
+    if (desc.trim().length < 10 || imageFile) return;
+    setClassifyingText(true);
+    setClassification(null);
+    setIssueType("");
+    setManualOverride(false);
+    try {
+      const result = await classifyReportDescription({ data: { description: desc.trim() } });
+      setClassification(result);
+      setIssueType(result.issueType);
+      toast.success(`Detected from description: ${ISSUE_META[result.issueType].label}`, {
+        description: `${Math.round(result.confidence * 100)}% · Text analysis`,
+      });
+    } catch {
+      toast.error("Could not analyze description");
+    } finally {
+      setClassifyingText(false);
+    }
+  };
+
+  useEffect(() => {
+    if (imageFile) return;
+    const timer = window.setTimeout(() => {
+      if (description.trim().length >= 10) void classifyDescription(description);
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [description, imageFile]);
 
   const onFile = (f?: File) => {
     if (!f) return;
@@ -257,12 +321,17 @@ function ReportFlow({
   };
 
   const submit = async () => {
-    if (!imageFile) return toast.error("Please upload an image of the issue");
-    if (classifying) return toast.error("Please wait for image classification to finish");
-    if (!issueType) return toast.error("Upload a photo so AI can detect the issue type");
-
-    if (description.trim().length < 10) {
-      return toast.error("Description must be at least 10 characters");
+    const hasPhoto = Boolean(imageFile);
+    const hasDescription = description.trim().length >= 10;
+    if (!hasPhoto && !hasDescription) {
+      return toast.error("Add a photo or a description (min. 10 characters)");
+    }
+    if (classifying || classifyingText) {
+      return toast.error("Please wait for AI analysis to finish");
+    }
+    const resolvedType = issueType || classification?.issueType;
+    if (!resolvedType) {
+      return toast.error("Wait for AI detection or select an issue type");
     }
 
     setProcessing(true);
@@ -277,17 +346,26 @@ function ReportFlow({
       formData.set("lat", String(location.lat));
       formData.set("lng", String(location.lng));
       formData.set("locationLabel", location.label);
-      formData.set("image", imageFile);
+      formData.set("issueType", resolvedType);
+      if (imageFile) formData.set("image", imageFile);
 
       const res = await submitReport({ data: formData });
       setResult(res);
       const updatedQueues = await getQueues();
       setQueues(updatedQueues);
       onSubmitted();
-      toast.success(
-        res.routed ? `Report routed to ${res.department}` : "Report sent to Manual Review Queue",
-        { description: `Ticket ${res.ticketId} · Confidence ${(res.final * 100).toFixed(1)}%` },
-      );
+      if (res.isMultiIssue && res.issueBreakdown?.length) {
+        toast.success("Multi-issue alert sent to all affected departments", {
+          description: res.issueBreakdown
+            .map((item) => `${ISSUE_META[item.issueType].label} ${item.percentage}%`)
+            .join(" · "),
+        });
+      } else {
+        toast.success(
+          res.routed ? `Report routed to ${res.department}` : "Report sent to Manual Review Queue",
+          { description: `Ticket ${res.ticketId} · Confidence ${(res.final * 100).toFixed(1)}%` },
+        );
+      }
     } catch (error) {
       const message =
         error instanceof Error
@@ -315,6 +393,7 @@ function ReportFlow({
     setImageUrl(null);
     setClassification(null);
     setClassifying(false);
+    setClassifyingText(false);
     setManualOverride(false);
     setResult(null);
   };
@@ -326,13 +405,13 @@ function ReportFlow({
           <div className="max-w-2xl mb-10">
             <Badge variant="outline" className="mb-3 border-primary/40 text-primary bg-primary/5">Report Submission</Badge>
             <h2 className="text-3xl md:text-4xl font-bold">Submit a civic issue in under 30 seconds.</h2>
-            <p className="mt-4 text-muted-foreground">Upload a photo — AI auto-detects the issue type. Add a short description and confirm your location.</p>
+            <p className="mt-4 text-muted-foreground">Upload a photo, write a description, or both — at least one is required. AI detects single or multiple issues and notifies departments with percentage breakdown.</p>
           </div>
 
           <div className="grid lg:grid-cols-5 gap-6">
             <Card className="glass border-white/10 p-6 lg:col-span-3">
               <div className="space-y-2">
-                <Label>Upload Image</Label>
+                <Label>Upload Image (optional if you describe the issue)</Label>
                 <button
                   type="button"
                   onClick={() => fileRef.current?.click()}
@@ -359,22 +438,16 @@ function ReportFlow({
                 </button>
               </div>
 
-              {localClassifier.missing && !localClassifier.loading && (
-                <div className="mt-5 rounded-xl border border-amber-400/30 bg-amber-500/10 p-4 text-sm text-amber-200">
-                  No trained model yet. Run <code className="font-mono text-xs">python ml/train.py</code> after adding photos — see <code className="font-mono text-xs">ml/README.md</code>.
-                </div>
-              )}
-
-              {(classifying || classification) && (
+              {(classifying || classifyingText || classification) && (
                 <div className="mt-5 rounded-xl bg-white/5 border border-white/10 p-4">
                   <div className="flex items-center gap-2 text-sm font-medium mb-2">
                     <Eye className="h-4 w-4 text-primary" />
-                    Vision Detection
+                    {imageFile ? "Vision Detection" : "Text Detection"}
                   </div>
-                  {classifying ? (
+                  {classifying || classifyingText ? (
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <Activity className="h-4 w-4 animate-pulse" />
-                      Analyzing image and classifying issue type…
+                      {imageFile ? "Analyzing image…" : "Analyzing description…"}
                     </div>
                   ) : classification ? (
                     <div className="space-y-3">
@@ -398,6 +471,26 @@ function ReportFlow({
                         )}
                       </div>
                       <p className="text-xs text-muted-foreground">{classification.reason}</p>
+                      {(classification.perClassScores || classification.alternatives.length > 0) && (
+                        <div className="rounded-lg bg-black/20 p-3 space-y-2">
+                          <div className="text-xs font-medium text-muted-foreground">Issue mix preview</div>
+                          {(["pothole", "garbage", "manhole"] as IssueType[]).map((type) => {
+                            const pct = Math.round(
+                              (classification.perClassScores?.[type] ??
+                                (type === classification.issueType
+                                  ? classification.confidence
+                                  : classification.alternatives.find((a) => a.issueType === type)?.confidence ?? 0)) *
+                                100,
+                            );
+                            return (
+                              <div key={type} className="flex justify-between text-xs">
+                                <span>{ISSUE_META[type].label}</span>
+                                <span className="font-mono">{pct}%</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                       {issueType && (
                         <p className="flex items-center gap-1.5 text-xs text-emerald-300">
                           <CheckCircle2 className="h-3.5 w-3.5" />
@@ -425,10 +518,10 @@ function ReportFlow({
                   <Select
                     value={issueType || undefined}
                     onValueChange={(v) => handleIssueTypeChange(v as IssueType)}
-                    disabled={classifying || !imageFile}
+                    disabled={classifying || classifyingText}
                   >
                     <SelectTrigger className="bg-white/5 border-white/10">
-                      <SelectValue placeholder={classifying ? "Detecting from photo…" : "Upload a photo first"} />
+                      <SelectValue placeholder={classifying || classifyingText ? "Detecting…" : "Select or wait for AI"} />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="pothole">🕳  Pothole</SelectItem>
@@ -454,22 +547,22 @@ function ReportFlow({
 
               <div className="space-y-2 mt-5">
                 <div className="flex items-center justify-between">
-                  <Label>Description</Label>
-                  <span className={`text-xs ${description.trim().length < 10 ? "text-amber-400" : "text-muted-foreground"}`}>
-                    {description.trim().length}/10 min
+                  <Label>Description (optional if you upload a photo)</Label>
+                  <span className={`text-xs ${!imageFile && description.trim().length < 10 ? "text-amber-400" : "text-muted-foreground"}`}>
+                    {description.trim().length}/10 {!imageFile ? "required" : "optional"}
                   </span>
                 </div>
                 <Textarea
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
-                  placeholder="Describe the issue — size, severity, hazards, traffic impact (min. 10 characters)..."
+                  placeholder="Describe the issue — mention pothole, garbage, manhole, severity, hazards (min. 10 chars if no photo)..."
                   rows={4}
                   className="bg-white/5 border-white/10 resize-none"
                 />
               </div>
 
               <div className="flex flex-wrap gap-3 mt-6">
-                <Button size="lg" onClick={submit} disabled={processing || classifying} className="glow">
+                <Button size="lg" onClick={submit} disabled={processing || classifying || classifyingText} className="glow">
                   {processing ? (<><Activity className="mr-2 h-4 w-4 animate-pulse" />Analyzing...</>) : (<><Brain className="mr-2 h-4 w-4" />Run AI Analysis</>)}
                 </Button>
                 <Button size="lg" variant="outline" onClick={reset}>Reset</Button>
@@ -571,12 +664,31 @@ function AnalysisPanel({ result }: { result: AnalysisResult }) {
         <div className="flex items-center justify-between mb-6">
           <div>
             <div className="text-xs uppercase tracking-widest text-muted-foreground">Detected Issue</div>
-            <div className="text-2xl font-bold mt-1">{meta.label}</div>
+            <div className="text-2xl font-bold mt-1">
+              {result.isMultiIssue ? "Multiple issues detected" : meta.label}
+            </div>
           </div>
           <Badge className={`bg-gradient-to-r ${meta.color} text-background border-0`}>
             <Sparkles className="h-3 w-3 mr-1" />Classified
           </Badge>
         </div>
+
+        {result.issueBreakdown && result.issueBreakdown.length > 0 && (
+          <div className="mb-6 rounded-xl bg-white/5 border border-white/10 p-4 space-y-3">
+            <div className="text-sm font-medium">Department notification breakdown</div>
+            {result.issueBreakdown.map((item) => (
+              <div key={item.issueType} className="flex items-center justify-between text-sm">
+                <span>
+                  {ISSUE_META[item.issueType].label} → {item.department}
+                </span>
+                <span className="font-mono text-primary">{item.percentage}%</span>
+              </div>
+            ))}
+            {result.emailsSent ? (
+              <p className="text-xs text-emerald-300">{result.emailsSent} department email(s) queued/sent.</p>
+            ) : null}
+          </div>
+        )}
 
         <div className="space-y-5">
           <ScoreRow icon={Eye} label="Vision Confidence" value={result.vision} color="oklch(0.72 0.18 230)" />
@@ -594,11 +706,15 @@ function AnalysisPanel({ result }: { result: AnalysisResult }) {
         {result.routed ? (
           <div className="rounded-2xl bg-gradient-to-br from-emerald-500/20 to-teal-500/10 border border-emerald-400/30 p-5 flex flex-col items-center text-center">
             <CheckCircle2 className="h-10 w-10 text-emerald-400 mb-2" />
-            <div className="font-semibold">Auto Routed</div>
+            <div className="font-semibold">{result.isMultiIssue ? "Multi-Department Alert" : "Auto Routed"}</div>
             <div className="text-xs text-muted-foreground mt-1">Score ≥ 0.45 threshold</div>
-            <div className="mt-4 flex items-center gap-2 text-sm">
-              <DeptIcon className="h-4 w-4 text-emerald-300" />
-              <span className="font-medium">{result.department}</span>
+            <div className="mt-4 flex flex-col gap-2 text-sm">
+              {(result.notifiedDepartments ?? [result.department]).map((dept) => (
+                <div key={dept} className="flex items-center justify-center gap-2">
+                  <DeptIcon className="h-4 w-4 text-emerald-300" />
+                  <span className="font-medium">{dept}</span>
+                </div>
+              ))}
             </div>
           </div>
         ) : (
@@ -617,7 +733,7 @@ function AnalysisPanel({ result }: { result: AnalysisResult }) {
         <div className="mt-auto pt-5">
           <div className="rounded-lg bg-primary/10 border border-primary/20 px-3 py-2 text-xs flex items-center gap-2">
             <Radio className="h-3.5 w-3.5 text-primary" />
-            Notification sent to citizen & department dashboard.
+            Email + dashboard notifications sent to affected department(s).
           </div>
         </div>
       </Card>
@@ -666,7 +782,10 @@ function RoutingBoard({
     <div className="grid lg:grid-cols-3 gap-5">
       {departments.map((d) => {
         const queueData = queues.departments.find((item) => item.department === d.key);
-        const active = result?.routed && result.department === d.key;
+        const active =
+          result?.routed &&
+          (result.department === d.key || result.notifiedDepartments?.includes(d.key));
+        const share = result?.issueBreakdown?.find((item) => item.department === d.key);
         const queue = (queueData?.activeQueue ?? 0) + (active ? 1 : 0);
         return (
           <Card key={d.key} className={`relative bg-gradient-to-br ${d.color} border p-6 ${active ? "ring-2 ring-primary glow" : ""}`}>
@@ -699,6 +818,9 @@ function RoutingBoard({
                   <Badge variant="outline" className="border-emerald-400/40 text-emerald-300">Priority</Badge>
                 </div>
                 <div className="text-muted-foreground mt-1">{result.location.label}</div>
+                {share && (
+                  <div className="mt-2 text-emerald-200 font-mono">{share.percentage}% {ISSUE_META[share.issueType].label}</div>
+                )}
               </div>
             )}
           </Card>

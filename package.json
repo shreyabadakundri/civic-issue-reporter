@@ -12,7 +12,11 @@
     "ml:import-kaggle": "ml\\.venv\\Scripts\\python.exe ml/import_kaggle_datasets.py",
     "ml:train": "ml\\.venv\\Scripts\\python.exe ml/train.py",
     "ml:train:quick": "ml\\.venv\\Scripts\\python.exe ml/train.py --quick",
-    "ml:export": "ml\\.venv\\Scripts\\python.exe ml/export_tfjs.py"
+    "ml:export": "ml\\.venv\\Scripts\\python.exe ml/export_tfjs.py",
+    "test:email": "npx tsx scripts/send-test-email.ts",
+    "test:mongo": "npx tsx scripts/test-mongo-connection.ts",
+    "db:migrate": "npx tsx scripts/migrate-store-to-mongo.ts",
+    "db:status": "npx tsx scripts/db-status.ts"
   },
   "dependencies": {
     "@radix-ui/react-accordion": "^1.2.12",
@@ -53,6 +57,8 @@
     "input-otp": "^1.4.2",
     "jpeg-js": "^0.4.4",
     "lucide-react": "^0.544.0",
+    "mongodb": "^7.7.0",
+    "nodemailer": "^10.0.16",
     "pngjs": "^7.0.0",
     "react": "^19.1.1",
     "react-day-picker": "^9.11.0",
@@ -71,6 +77,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/jpeg-js": "^0.3.0",
     "@types/node": "^24.5.2",
+    "@types/nodemailer": "^8.0.2",
     "@types/react": "^19.1.13",
     "@types/react-dom": "^19.1.9",
     "@vitejs/plugin-react": "^5.0.3",

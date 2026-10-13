@@ -36,6 +36,9 @@ export function buildClassificationFromScores(
   indexed.sort((a, b) => b.confidence - a.confidence);
   const top = indexed[0];
   const alternatives = indexed.slice(1, 3);
+  const perClassScores = Object.fromEntries(
+    indexed.map((item) => [item.issueType, item.confidence]),
+  ) as Record<IssueType, number>;
 
   return {
     issueType: top.issueType,
@@ -44,6 +47,7 @@ export function buildClassificationFromScores(
     usedCloudVision: false,
     modelSource,
     alternatives,
+    perClassScores,
   };
 }
 

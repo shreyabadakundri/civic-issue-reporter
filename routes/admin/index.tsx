@@ -36,6 +36,7 @@ import {
   changeReportStatus,
   fetchReports,
   getDashboardSummary,
+  getEmailOutbox,
 } from "@/server/reports";
 
 export const Route = createFileRoute("/admin/")({
@@ -59,6 +60,11 @@ function AdminPage() {
   const reportsQuery = useQuery({
     queryKey: ["admin-reports"],
     queryFn: () => fetchReports({ data: { limit: 100 } }),
+  });
+
+  const emailQuery = useQuery({
+    queryKey: ["admin-emails"],
+    queryFn: () => getEmailOutbox(),
   });
 
   const statusMutation = useMutation({
@@ -108,6 +114,46 @@ function AdminPage() {
             </Card>
           ))}
         </div>
+
+        <Card className="glass border-white/10 p-6">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
+            <div>
+              <div className="font-semibold">Department Email Outbox</div>
+              <p className="text-sm text-muted-foreground mt-1">
+                Preview emails sent to Public Works, Sanitation, and Sewer Maintenance (demo panel).
+              </p>
+            </div>
+            <Button size="sm" variant="outline" onClick={() => emailQuery.refetch()}>
+              <RefreshCw className={`mr-2 h-4 w-4 ${emailQuery.isFetching ? "animate-spin" : ""}`} />
+              Refresh
+            </Button>
+          </div>
+          <div className="space-y-3 max-h-96 overflow-y-auto">
+            {(emailQuery.data ?? []).length === 0 ? (
+              <p className="text-sm text-muted-foreground">No emails yet — submit a report to generate alerts.</p>
+            ) : (
+              (emailQuery.data ?? []).map((email) => (
+                <details key={email.id} className="rounded-lg border border-white/10 bg-white/5 p-3">
+                  <summary className="cursor-pointer text-sm font-medium">
+                    {email.subject}{" "}
+                    <Badge variant="outline" className="ml-2 text-xs">
+                      {email.delivery}
+                    </Badge>
+                  </summary>
+                  <div className="mt-2 text-xs text-muted-foreground space-y-1">
+                    <div>To: {email.to}</div>
+                    <div>Department: {email.department}</div>
+                    <div>Ticket: {email.reportId}</div>
+                  </div>
+                  <div
+                    className="mt-3 rounded-md bg-black/30 p-3 text-xs prose prose-invert max-w-none"
+                    dangerouslySetInnerHTML={{ __html: email.html }}
+                  />
+                </details>
+              ))
+            )}
+          </div>
+        </Card>
 
         <Card className="glass border-white/10 p-6">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-5">

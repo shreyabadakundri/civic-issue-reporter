@@ -142,7 +142,11 @@ async function classifyWithCohere(input: ClassificationInput): Promise<ImageClas
       }),
     });
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      console.warn("[cohere vision]", response.status, errText.slice(0, 200));
+      return null;
+    }
 
     const payload = (await response.json()) as {
       message?: { content?: Array<{ type?: string; text?: string }> };
@@ -151,7 +155,8 @@ async function classifyWithCohere(input: ClassificationInput): Promise<ImageClas
     if (!content) return null;
 
     return parseClassificationPayload(content, "cohere", "Cohere vision classification");
-  } catch {
+  } catch (error) {
+    console.warn("[cohere vision] request failed:", error);
     return null;
   }
 }
@@ -219,17 +224,16 @@ function classifyHeuristic(input: ClassificationInput): ImageClassificationResul
   const top = scores[0];
   const second = scores[1];
   const hasSignal = top.score > 0;
-  const issueType = top.issueType;
   const confidence = hasSignal
     ? clamp(0.52 + top.score * 0.35 - (second?.score ?? 0) * 0.1)
     : 0.35;
 
   return {
-    issueType,
+    issueType: top.issueType,
     confidence,
     reason: hasSignal
-      ? `Matched ${ISSUE_META[issueType].label} from filename/description keywords`
-      : "No photo model found — run python ml/train.py or set COHERE_API_KEY / OPENAI_API_KEY",
+      ? `Matched ${ISSUE_META[top.issueType].label} from filename/description keywords`
+      : "No clear image signal — set COHERE_API_KEY or pick issue type manually (avoid relying on filename-only guesses)",
     usedCloudVision: false,
     modelSource: "heuristic",
     alternatives: scores.slice(1, 3).map((item) => ({
@@ -262,6 +266,34 @@ export async function classifyIssueFromImage(
   }
 
   return classifyHeuristic(input);
+}
+
+export function classifyIssueFromDescription(description: string): ImageClassificationResult {
+  const scores = ISSUE_TYPES.map((issueType) => ({
+    issueType,
+    score: keywordScore(description, ISSUE_META[issueType].keywords),
+  })).sort((a, b) => b.score - a.score);
+
+  const top = scores[0];
+  const hasSignal = top.score > 0;
+  const perClassScores = Object.fromEntries(
+    scores.map((item) => [item.issueType, item.score / (scores.reduce((a, b) => a + b.score, 0) || 1)]),
+  ) as Record<IssueType, number>;
+
+  return {
+    issueType: top.issueType,
+    confidence: hasSignal ? clamp(0.55 + top.score * 0.35) : 0.4,
+    reason: hasSignal
+      ? `Description keywords suggest ${ISSUE_META[top.issueType].label}`
+      : "Description provided — defaulting to highest keyword match",
+    usedCloudVision: false,
+    modelSource: "heuristic",
+    alternatives: scores.slice(1, 3).map((item) => ({
+      issueType: item.issueType,
+      confidence: clamp(item.score * 0.5 + 0.12),
+    })),
+    perClassScores,
+  };
 }
 
 function buildNlpScoreHeuristic(issueType: IssueType, description: string) {

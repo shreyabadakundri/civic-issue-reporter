@@ -34,7 +34,12 @@ function ReportDetailPage() {
               Ticket Tracking
             </Badge>
             <h1 className="text-3xl font-bold font-mono">{report.id}</h1>
-            <p className="mt-2 text-muted-foreground">{meta.label} · {report.department}</p>
+            <p className="mt-2 text-muted-foreground">
+              {report.isMultiIssue ? "Multiple issues" : meta.label} · {report.department}
+              {report.notifiedDepartments && report.notifiedDepartments.length > 1
+                ? ` (+${report.notifiedDepartments.length - 1} depts notified)`
+                : ""}
+            </p>
           </div>
           <Link to="/">
             <Button variant="outline"><ArrowLeft className="mr-2 h-4 w-4" />Back to site</Button>
@@ -55,7 +60,7 @@ function ReportDetailPage() {
               <MapPin className="h-4 w-4 text-accent" />
               {report.locationLabel} ({report.lat.toFixed(4)}, {report.lng.toFixed(4)})
             </div>
-            {report.imagePath && (
+            {report.imagePath && !report.imagePath.includes("demo-placeholder") && (
               <img
                 src={report.imagePath}
                 alt="Report evidence"
@@ -66,6 +71,17 @@ function ReportDetailPage() {
 
           <Card className="glass border-white/10 p-6 space-y-5">
             <div className="font-semibold">AI Analysis</div>
+            {report.issueBreakdown && report.issueBreakdown.length > 0 && (
+              <div className="rounded-lg bg-white/5 p-3 space-y-2 text-sm">
+                <div className="text-xs uppercase text-muted-foreground">Issue breakdown</div>
+                {report.issueBreakdown.map((item) => (
+                  <div key={item.issueType} className="flex justify-between">
+                    <span>{ISSUE_META[item.issueType].label} → {item.department}</span>
+                    <span className="font-mono">{item.percentage}%</span>
+                  </div>
+                ))}
+              </div>
+            )}
             {[
               { label: "Vision Confidence", value: report.visionScore },
               { label: "NLP Confidence", value: report.nlpScore },
