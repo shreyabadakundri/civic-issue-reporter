@@ -8,9 +8,20 @@ export type ReportStatus =
   | "resolved"
   | "closed";
 
+/** Single-issue auto-route when fused/vision confidence meets this (45%). */
 export const ROUTING_THRESHOLD = 0.45;
+
+/** Multi-issue: each detected issue must meet this to auto-route (24%). */
+export const MULTI_ISSUE_MIN_CONFIDENCE = 0.24;
+
+/** Minimum score to treat as a visible issue candidate in UI and breakdown (8%). */
+export const ISSUE_CANDIDATE_MIN_CONFIDENCE = 0.08;
+
 export const VISION_WEIGHT = 0.7;
 export const NLP_WEIGHT = 0.3;
+
+/** External API calls (vision / NLP). */
+export const AI_REQUEST_TIMEOUT_MS = 15_000;
 
 export const ISSUE_META: Record<
   IssueType,

@@ -17,11 +17,14 @@ import {
 import { toast } from "sonner";
 
 import { useLocalClassifier } from "@/hooks/use-local-classifier";
-import { ISSUE_META, type IssueType } from "@/lib/constants";
 import {
   ISSUE_CANDIDATE_MIN_CONFIDENCE,
+  ISSUE_META,
   MULTI_ISSUE_MIN_CONFIDENCE,
-} from "@/lib/multi-issue";
+  ROUTING_THRESHOLD,
+  type IssueType,
+} from "@/lib/constants";
+import { compressImageForUpload } from "@/lib/compress-image";
 import type { AnalysisResult, ImageClassificationResult } from "@/lib/types";
 import { saveLastAnalysis } from "@/lib/last-analysis";
 import {
@@ -189,6 +192,35 @@ type LocationState = {
   isLive: boolean;
 };
 
+const GPS_CACHE_KEY = "civicmind:gpsCache";
+const GPS_CACHE_MAX_AGE_MS = 5 * 60 * 1000;
+
+type GpsCache = { lat: number; lng: number; savedAt: number };
+
+function readGpsCache(): GpsCache | null {
+  try {
+    const raw = sessionStorage.getItem(GPS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as GpsCache;
+    if (typeof parsed.lat !== "number" || typeof parsed.lng !== "number") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeGpsCache(lat: number, lng: number) {
+  sessionStorage.setItem(
+    GPS_CACHE_KEY,
+    JSON.stringify({ lat, lng, savedAt: Date.now() } satisfies GpsCache),
+  );
+}
+
+function coordLabel(lat: number, lng: number, cached?: boolean) {
+  const coords = `${lat.toFixed(5)}°, ${lng.toFixed(5)}°`;
+  return cached ? `GPS (cached) · ${coords}` : `GPS · ${coords}`;
+}
+
 export function ReportFlow({ onSubmitted }: { onSubmitted: () => void }) {
   const navigate = useNavigate();
   const [issueType, setIssueType] = useState<IssueType | "">("");
@@ -209,19 +241,17 @@ export function ReportFlow({ onSubmitted }: { onSubmitted: () => void }) {
   });
   const fileRef = useRef<HTMLInputElement>(null);
   const localClassifier = useLocalClassifier();
-  const geoWatchRef = useRef<number | null>(null);
 
-  const applyGpsPosition = (pos: GeolocationPosition) => {
-    if (geoWatchRef.current != null) {
-      navigator.geolocation.clearWatch(geoWatchRef.current);
-      geoWatchRef.current = null;
-    }
+  const applyGpsPosition = (pos: GeolocationPosition, fromCache = false) => {
+    const lat = pos.coords.latitude;
+    const lng = pos.coords.longitude;
+    writeGpsCache(lat, lng);
     setLocation({
-      lat: pos.coords.latitude,
-      lng: pos.coords.longitude,
-      label: `Live GPS · ${pos.coords.latitude.toFixed(5)}°, ${pos.coords.longitude.toFixed(5)}°`,
+      lat,
+      lng,
+      label: coordLabel(lat, lng, fromCache),
       loading: false,
-      isLive: true,
+      isLive: !fromCache,
     });
   };
 
@@ -241,48 +271,40 @@ export function ReportFlow({ onSubmitted }: { onSubmitted: () => void }) {
       ...prev,
       loading: true,
       label: "Detecting your location…",
-      isLive: false,
     }));
 
-    if (geoWatchRef.current != null) {
-      navigator.geolocation.clearWatch(geoWatchRef.current);
-      geoWatchRef.current = null;
-    }
-
     navigator.geolocation.getCurrentPosition(
-      applyGpsPosition,
-      (err) => {
-        const hint =
-          err.code === err.PERMISSION_DENIED
-            ? "Location blocked — allow location for this site in the browser address bar"
-            : err.code === err.TIMEOUT
-              ? "Location timed out — move near a window or try again"
-              : "Could not get GPS — check device location is on";
+      (pos) => applyGpsPosition(pos, false),
+      () => {
+        const cached = readGpsCache();
+        if (cached) {
+          applyGpsPosition(
+            { coords: { latitude: cached.lat, longitude: cached.lng } } as GeolocationPosition,
+            true,
+          );
+          return;
+        }
         setLocation({
           lat: null,
           lng: null,
-          label: hint,
+          label: "GPS unavailable — click Refresh location",
           loading: false,
           isLive: false,
         });
       },
-      { enableHighAccuracy: true, timeout: 20_000, maximumAge: 0 },
-    );
-
-    geoWatchRef.current = navigator.geolocation.watchPosition(
-      applyGpsPosition,
-      () => {},
-      { enableHighAccuracy: true, maximumAge: 5_000 },
+      { enableHighAccuracy: false, timeout: 5_000, maximumAge: GPS_CACHE_MAX_AGE_MS },
     );
   };
 
   useEffect(() => {
+    const cached = readGpsCache();
+    if (cached && Date.now() - cached.savedAt < GPS_CACHE_MAX_AGE_MS) {
+      applyGpsPosition(
+        { coords: { latitude: cached.lat, longitude: cached.lng } } as GeolocationPosition,
+        true,
+      );
+    }
     refreshLocation();
-    return () => {
-      if (geoWatchRef.current != null) {
-        navigator.geolocation.clearWatch(geoWatchRef.current);
-      }
-    };
   }, []);
 
   const applyClassificationResult = (result: ImageClassificationResult, sourceLabel: string) => {
@@ -385,9 +407,12 @@ export function ReportFlow({ onSubmitted }: { onSubmitted: () => void }) {
 
   const onFile = (f?: File) => {
     if (!f) return;
-    setImageFile(f);
-    setImageUrl(URL.createObjectURL(f));
-    void classifyImage(f, description);
+    void (async () => {
+      const compressed = await compressImageForUpload(f);
+      setImageFile(compressed);
+      setImageUrl(URL.createObjectURL(compressed));
+      void classifyImage(compressed, description);
+    })();
   };
 
   const handleIssueTypeChange = (value: IssueType) => {
@@ -414,14 +439,18 @@ export function ReportFlow({ onSubmitted }: { onSubmitted: () => void }) {
         multiFromAi ? "Wait for AI detection to finish" : "Wait for AI detection or select an issue type",
       );
     }
-    if (location.loading) {
-      return toast.error("Waiting for live GPS — allow location access when prompted");
-    }
-    if (!location.isLive || location.lat == null || location.lng == null) {
-      return toast.error("Live location required", {
-        description: "Click “Refresh location” and allow location access for this site.",
+    const cached = readGpsCache();
+    const submitLat = location.lat ?? cached?.lat ?? null;
+    const submitLng = location.lng ?? cached?.lng ?? null;
+    if (submitLat == null || submitLng == null) {
+      return toast.error("Location needed once", {
+        description: "Click Refresh location and allow access — submission is not blocked while GPS is still loading.",
       });
     }
+    const submitLabel =
+      location.lat != null && location.lng != null
+        ? location.label
+        : coordLabel(submitLat, submitLng, true);
 
     setProcessing(true);
 
@@ -430,10 +459,19 @@ export function ReportFlow({ onSubmitted }: { onSubmitted: () => void }) {
       formData.set("issueType", resolvedType);
       formData.set("manualOverride", String(manualOverride));
       formData.set("description", description.trim());
-      formData.set("lat", String(location.lat));
-      formData.set("lng", String(location.lng));
-      formData.set("locationLabel", location.label);
-      if (imageFile) formData.set("image", imageFile);
+      formData.set("lat", String(submitLat));
+      formData.set("lng", String(submitLng));
+      formData.set("locationLabel", submitLabel);
+      if (imageFile) {
+        formData.set("image", imageFile);
+        formData.set(
+          "imageFingerprint",
+          `${imageFile.size}:${imageFile.name}:${imageFile.lastModified}`,
+        );
+      }
+      if (classification && imageFile) {
+        formData.set("visionClassification", JSON.stringify(classification));
+      }
 
       const res = await submitReport({ data: formData });
       saveLastAnalysis(res);
@@ -676,11 +714,7 @@ export function ReportFlow({ onSubmitted }: { onSubmitted: () => void }) {
                   <div className="flex items-center justify-between gap-2">
                     <Label>
                       Location{" "}
-                      {location.loading
-                        ? "(detecting…)"
-                        : location.isLive
-                          ? "(live GPS)"
-                          : "(required)"}
+                      {location.loading ? "(detecting…)" : location.lat != null ? "(GPS)" : "(refresh if needed)"}
                     </Label>
                     <Button type="button" variant="outline" size="sm" onClick={refreshLocation}>
                       Refresh location
@@ -733,7 +767,7 @@ export function ReportFlow({ onSubmitted }: { onSubmitted: () => void }) {
                   { i: Eye, t: "Vision Detection", d: "Classifies issue & severity" },
                   { i: Languages, t: "NLP Validation", d: "Confirms textual context" },
                   { i: Gauge, t: "Weighted Scoring", d: "0.7 × Vision + 0.3 × NLP" },
-                  { i: Workflow, t: "Auto-Route / Review", d: "Threshold = 0.45" },
+                  { i: Workflow, t: "Auto-Route / Review", d: `Single ≥ ${Math.round(ROUTING_THRESHOLD * 100)}% · multi each ≥ ${Math.round(MULTI_ISSUE_MIN_CONFIDENCE * 100)}%` },
                 ].map((s, i) => (
                   <li key={s.t} className="flex gap-3">
                     <div className="h-8 w-8 shrink-0 rounded-lg bg-gradient-to-br from-primary/30 to-accent/30 grid place-items-center text-xs font-bold">{i + 1}</div>
@@ -813,9 +847,22 @@ function EmptyState() {
   );
 }
 
+function routingDecisionCopy(result: AnalysisResult) {
+  if (result.routed) {
+    return result.isMultiIssue
+      ? `All detected issues met the ${Math.round(MULTI_ISSUE_MIN_CONFIDENCE * 100)}% multi-issue threshold`
+      : `Confidence met the ${Math.round(ROUTING_THRESHOLD * 100)}% auto-route threshold`;
+  }
+  if (result.isMultiIssue) {
+    return `Multi-issue: one or more types below ${Math.round(MULTI_ISSUE_MIN_CONFIDENCE * 100)}% — manual review`;
+  }
+  return `Below ${Math.round(ROUTING_THRESHOLD * 100)}% auto-route threshold — manual review`;
+}
+
 function AnalysisPanel({ result }: { result: AnalysisResult }) {
   const meta = ISSUE_META[result.issueType];
   const DeptIcon = ISSUE_UI[result.issueType].deptIcon;
+  const nlpUnavailable = result.nlp === 0 && result.final === result.vision;
   return (
     <div className="grid lg:grid-cols-3 gap-6 fade-up">
       <Card className="glass border-white/10 p-6 lg:col-span-2">
@@ -850,11 +897,22 @@ function AnalysisPanel({ result }: { result: AnalysisResult }) {
 
         <div className="space-y-5">
           <ScoreRow icon={Eye} label="Vision Confidence" value={result.vision} color="oklch(0.72 0.18 230)" />
-          <ScoreRow icon={Languages} label="NLP Confidence" value={result.nlp} color="oklch(0.7 0.2 175)" />
+          {nlpUnavailable ? (
+            <div className="flex items-center justify-between text-sm">
+              <span className="flex items-center gap-2 text-muted-foreground">
+                <Languages className="h-4 w-4" /> NLP Confidence
+              </span>
+              <span className="font-mono text-muted-foreground">N/A</span>
+            </div>
+          ) : (
+            <ScoreRow icon={Languages} label="NLP Confidence" value={result.nlp} color="oklch(0.7 0.2 175)" />
+          )}
           <div className="h-px bg-white/10 my-2" />
           <ScoreRow icon={Gauge} label="Weighted Final Score" value={result.final} color="oklch(0.75 0.18 90)" bold />
           <div className="text-xs text-muted-foreground font-mono bg-white/5 rounded-md px-3 py-2">
-            Final = (Vision × 0.7) + (NLP × 0.3) = ({(result.vision).toFixed(2)} × 0.7) + ({(result.nlp).toFixed(2)} × 0.3) = {result.final.toFixed(3)}
+            {nlpUnavailable
+              ? `Final = vision-only score = ${result.final.toFixed(3)}`
+              : `Final = (Vision × 0.7) + (NLP × 0.3) = (${result.vision.toFixed(2)} × 0.7) + (${result.nlp.toFixed(2)} × 0.3) = ${result.final.toFixed(3)}`}
           </div>
         </div>
       </Card>
@@ -865,7 +923,7 @@ function AnalysisPanel({ result }: { result: AnalysisResult }) {
           <div className="rounded-2xl bg-gradient-to-br from-emerald-500/20 to-teal-500/10 border border-emerald-400/30 p-5 flex flex-col items-center text-center">
             <CheckCircle2 className="h-10 w-10 text-emerald-400 mb-2" />
             <div className="font-semibold">{result.isMultiIssue ? "Multi-Department Alert" : "Auto Routed"}</div>
-            <div className="text-xs text-muted-foreground mt-1">Score ≥ 0.45 threshold</div>
+            <div className="text-xs text-muted-foreground mt-1">{routingDecisionCopy(result)}</div>
             <div className="mt-4 flex flex-col gap-2 text-sm">
               {(result.notifiedDepartments ?? [result.department]).map((dept) => (
                 <div key={dept} className="flex items-center justify-center gap-2">
@@ -879,7 +937,7 @@ function AnalysisPanel({ result }: { result: AnalysisResult }) {
           <div className="rounded-2xl bg-gradient-to-br from-amber-500/20 to-orange-500/10 border border-amber-400/30 p-5 flex flex-col items-center text-center">
             <AlertTriangle className="h-10 w-10 text-amber-400 mb-2" />
             <div className="font-semibold">Manual Review Queue</div>
-            <div className="text-xs text-muted-foreground mt-1">Score &lt; 0.45 threshold</div>
+            <div className="text-xs text-muted-foreground mt-1">{routingDecisionCopy(result)}</div>
             <div className="mt-4 text-sm">Awaiting officer triage</div>
           </div>
         )}

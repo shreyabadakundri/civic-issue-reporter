@@ -1,10 +1,12 @@
 import {
+  AI_REQUEST_TIMEOUT_MS,
   ISSUE_META,
   NLP_WEIGHT,
   ROUTING_THRESHOLD,
   VISION_WEIGHT,
   type IssueType,
 } from "./constants";
+import { fetchWithTimeout } from "./fetch-with-timeout";
 import type { ImageClassificationResult } from "./types";
 
 export type { ImageClassificationResult };
@@ -158,7 +160,9 @@ async function classifyWithCohere(input: ClassificationInput): Promise<ImageClas
   if (!apiKey) return null;
 
   try {
-    const response = await fetch("https://api.cohere.com/v2/chat", {
+    const response = await fetchWithTimeout(
+      "https://api.cohere.com/v2/chat",
+      {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -184,7 +188,9 @@ async function classifyWithCohere(input: ClassificationInput): Promise<ImageClas
           },
         ],
       }),
-    });
+    },
+      AI_REQUEST_TIMEOUT_MS,
+    );
 
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
@@ -210,7 +216,9 @@ async function classifyWithOpenAi(input: ClassificationInput): Promise<ImageClas
   if (!apiKey) return null;
 
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetchWithTimeout(
+      "https://api.openai.com/v1/chat/completions",
+      {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -241,7 +249,9 @@ async function classifyWithOpenAi(input: ClassificationInput): Promise<ImageClas
           },
         ],
       }),
-    });
+    },
+      AI_REQUEST_TIMEOUT_MS,
+    );
 
     if (!response.ok) return null;
 
@@ -368,24 +378,28 @@ async function buildNlpScoreWithCohere(
   if (!apiKey || !description.trim()) return null;
 
   try {
-    const response = await fetch("https://api.cohere.com/v2/chat", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
+    const response = await fetchWithTimeout(
+      "https://api.cohere.com/v2/chat",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          stream: false,
+          model: process.env.COHERE_NLP_MODEL ?? "command-a-03-2025",
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "user",
+              content: `Analyze this civic report for issue type "${issueType}". Return JSON only: {"score":0-1,"signals":["string"]}. score = how well the description supports the issue and urgency (1 = very clear/urgent). Description: ${description}`,
+            },
+          ],
+        }),
       },
-      body: JSON.stringify({
-        stream: false,
-        model: process.env.COHERE_NLP_MODEL ?? "command-a-03-2025",
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "user",
-            content: `Analyze this civic report for issue type "${issueType}". Return JSON only: {"score":0-1,"signals":["string"]}. score = how well the description supports the issue and urgency (1 = very clear/urgent). Description: ${description}`,
-          },
-        ],
-      }),
-    });
+      AI_REQUEST_TIMEOUT_MS,
+    );
 
     if (!response.ok) return null;
 
@@ -415,8 +429,8 @@ export async function analyzeReport(input: AnalysisInput): Promise<AnalysisOutpu
   let nlp: number;
   let nlpSignals: string[];
   if (photoOnly) {
-    nlp = vision;
-    nlpSignals = ["No description — vision-only analysis"];
+    nlp = 0;
+    nlpSignals = ["N/A — no description provided"];
   } else {
     const cohereNlp = await buildNlpScoreWithCohere(input.issueType, input.description);
     nlp = cohereNlp?.score ?? buildNlpScoreHeuristic(input.issueType, input.description);

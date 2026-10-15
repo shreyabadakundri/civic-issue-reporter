@@ -1,5 +1,7 @@
 import {
+  ISSUE_CANDIDATE_MIN_CONFIDENCE,
   ISSUE_META,
+  MULTI_ISSUE_MIN_CONFIDENCE,
   NLP_WEIGHT,
   ROUTING_THRESHOLD,
   VISION_WEIGHT,
@@ -8,11 +10,7 @@ import {
 import type { Department } from "./constants";
 import type { ImageClassificationResult, IssueBreakdownItem } from "./types";
 
-/** Minimum fused score to auto-route a distinct issue (matches report UI hint). */
-export const MULTI_ISSUE_MIN_CONFIDENCE = 0.24;
-
-/** Minimum fused score to show / store as a visible issue candidate (aligns with report UI). */
-export const ISSUE_CANDIDATE_MIN_CONFIDENCE = 0.08;
+export { ISSUE_CANDIDATE_MIN_CONFIDENCE, MULTI_ISSUE_MIN_CONFIDENCE };
 
 const ISSUE_TYPES: IssueType[] = ["pothole", "garbage", "manhole"];
 

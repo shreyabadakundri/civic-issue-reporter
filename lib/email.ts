@@ -246,25 +246,30 @@ export async function notifyDepartmentsForReport(input: {
     byRecipient.set(mail.to, list);
   }
 
-  for (const [to, mails] of byRecipient) {
-    const primary = mails[0];
-    const subject =
-      mails.length > 1
-        ? `[CivicMind] ${input.reportId} — ${mails.length} departments notified @ ${input.locationLabel}`
-        : primary.subject;
-    const html =
-      mails.length > 1
-        ? buildEmailHtml({
-            reportId: input.reportId,
-            department: primary.department,
-            locationLabel: input.locationLabel,
-            description: input.description,
-            breakdown: input.breakdown,
-          })
-        : primary.html;
+  const sendResults = await Promise.all(
+    [...byRecipient.entries()].map(async ([to, mails]) => {
+      const primary = mails[0];
+      const subject =
+        mails.length > 1
+          ? `[CivicMind] ${input.reportId} — ${mails.length} departments notified @ ${input.locationLabel}`
+          : primary.subject;
+      const html =
+        mails.length > 1
+          ? buildEmailHtml({
+              reportId: input.reportId,
+              department: primary.department,
+              locationLabel: input.locationLabel,
+              description: input.description,
+              breakdown: input.breakdown,
+            })
+          : primary.html;
 
-    const smtpResult = await trySmtpSend(to, subject, html);
+      const smtpResult = await trySmtpSend(to, subject, html);
+      return { to, mails, subject, smtpResult };
+    }),
+  );
 
+  for (const { to, mails, subject, smtpResult } of sendResults) {
     for (const mail of mails) {
       const record: EmailOutboxRecord = {
         id: `EML-${crypto.randomBytes(4).toString("hex")}`,

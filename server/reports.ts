@@ -37,6 +37,7 @@ import {
   scoresFromDescription,
   summarizeMultiIssue,
 } from "@/lib/multi-issue";
+import { parseClassificationJsonField } from "@/lib/parse-classification-cache";
 import { ensureDemoPlaceholder, saveImageFromFile } from "@/lib/storage";
 import type { AnalysisResult, DepartmentQueue, ImageClassificationResult, PlatformStats, ReportRecord } from "@/lib/types";
 
@@ -89,9 +90,20 @@ function parseOptionalImage(data: FormData) {
   return image;
 }
 
+let bootstrapPromise: Promise<void> | null = null;
+
 async function bootstrapDb() {
-  ensureDemoPlaceholder();
-  await seedDemoReports();
+  if (!bootstrapPromise) {
+    bootstrapPromise = (async () => {
+      ensureDemoPlaceholder();
+      await seedDemoReports();
+    })();
+  }
+  await bootstrapPromise;
+}
+
+function imageFingerprint(file: File) {
+  return `${file.size}:${file.name}:${file.lastModified}`;
 }
 
 function toAnalysisResult(report: ReportRecord): AnalysisResult {
@@ -203,7 +215,13 @@ export const classifyReportDescription = createServerFn({ method: "POST" })
 export const submitReport = createServerFn({ method: "POST" })
   .validator((formData: FormData) => formData)
   .handler(async ({ data }): Promise<AnalysisResult> => {
+    const T0 = Date.now();
+    const lap = (label: string) => {
+      console.info(`[submitReport] ${label}: ${Date.now() - T0}ms`);
+    };
+
     await bootstrapDb();
+    lap("db-bootstrap");
 
     const image = parseOptionalImage(data);
     const parsed = submitReportFieldsSchema.safeParse({
@@ -219,21 +237,39 @@ export const submitReport = createServerFn({ method: "POST" })
     if (!parsed.success) {
       throw new Error(parsed.error.issues[0]?.message ?? "Invalid report data");
     }
+    lap("parse");
 
     const { description, lat, lng, locationLabel, manualOverride } = parsed.data;
     const hasDescription = description.trim().length >= 10;
 
     let classification: ImageClassificationResult;
     if (image) {
-      const imageBase64 = await fileToBase64(image);
-      classification = await classifyIssueFromImage({
-        imageBase64,
-        mimeType: image.type || "image/jpeg",
-        fileName: image.name,
-        description: hasDescription ? description.trim() : undefined,
-      });
+      const cached = parseClassificationJsonField(data.get("visionClassification"));
+      const fpClient = data.get("imageFingerprint");
+      const fpServer = imageFingerprint(image);
+      const fpMatch = typeof fpClient === "string" && fpClient === fpServer;
+
+      if (cached && fpMatch) {
+        classification = cached;
+        lap("classification-cache-hit");
+      } else {
+        if (cached && !fpMatch) {
+          console.warn("[submitReport] visionClassification rejected (image fingerprint mismatch)");
+        } else if (data.get("visionClassification") && !cached) {
+          console.warn("[submitReport] visionClassification rejected (invalid schema)");
+        }
+        const imageBase64 = await fileToBase64(image);
+        classification = await classifyIssueFromImage({
+          imageBase64,
+          mimeType: image.type || "image/jpeg",
+          fileName: image.name,
+          description: hasDescription ? description.trim() : undefined,
+        });
+        lap("classification-network");
+      }
     } else {
       classification = classifyIssueFromDescription(description);
+      lap("classification-text");
     }
 
     const visionScores = image ? scoresFromClassification(classification) : null;
@@ -255,10 +291,10 @@ export const submitReport = createServerFn({ method: "POST" })
     const activeBreakdown = normalizeActiveBreakdownPercentages(summary.activeBreakdown);
     const issueType = manualOverride && parsed.data.issueType ? parsed.data.issueType : summary.primaryIssueType;
 
-    const started = Date.now();
     const imagePath = image
       ? await saveImageFromFile(image)
       : "/uploads/demo-placeholder.jpg";
+    lap("image-save");
 
     const visionForAnalysis = summary.isMultiIssue
       ? Math.max(...activeBreakdown.map((b) => b.confidence), 0)
@@ -274,9 +310,11 @@ export const submitReport = createServerFn({ method: "POST" })
       usedCloudVision: classification.usedCloudVision,
       photoOnly: Boolean(image) && !hasDescription,
     });
+    lap("analysis");
 
     const status: ReportStatus = summary.routed ? "routed" : "manual_review";
     const id = await generateTicketId();
+    lap("ticket-id");
 
     const departmentsToNotify = summary.routed
       ? summary.isMultiIssue
@@ -317,27 +355,33 @@ export const submitReport = createServerFn({ method: "POST" })
       issueBreakdown: activeBreakdown,
       notifiedDepartments: departmentsToNotify,
     });
+    lap("db-insert");
 
-    const emails =
-      departmentsToNotify.length > 0
-        ? await notifyDepartmentsForReport({
-            reportId: id,
-            locationLabel,
-            description: description || "(Photo-only submission)",
-            breakdown: activeBreakdown,
-            departments: departmentsToNotify,
-          })
-        : [];
+    const emailsQueued = departmentsToNotify.length;
+    if (emailsQueued > 0) {
+      void notifyDepartmentsForReport({
+        reportId: id,
+        locationLabel,
+        description: description || "(Photo-only submission)",
+        breakdown: activeBreakdown,
+        departments: departmentsToNotify,
+      }).catch((err) => {
+        console.warn("[submitReport] async email failed:", err instanceof Error ? err.message : err);
+      });
+    }
+    lap("email-scheduled");
 
-    console.info(`Report ${id} analyzed in ${Date.now() - started}ms`, {
+    lap("total");
+    console.info(`[submitReport] ticket ${id}`, {
       multi: summary.isMultiIssue,
+      routed: summary.routed,
       departments: departmentsToNotify,
-      emails: emails.length,
+      emailsQueued,
     });
 
     return {
       ...toAnalysisResult(report),
-      emailsSent: emails.length,
+      emailsSent: emailsQueued,
     };
   });
 
