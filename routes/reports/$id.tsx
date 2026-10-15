@@ -85,16 +85,22 @@ function ReportDetailPage() {
               </div>
             )}
             {[
-              { label: "Vision Confidence", value: report.visionScore },
-              { label: "NLP Confidence", value: report.nlpScore },
-              { label: "Final Score", value: report.finalScore },
+              { label: "Vision Confidence", value: report.visionScore, na: false },
+              {
+                label: "NLP Confidence",
+                value: report.nlpScore,
+                na: report.nlpScore === 0 && report.finalScore === report.visionScore,
+              },
+              { label: "Final Score", value: report.finalScore, na: false },
             ].map((score) => (
               <div key={score.label}>
                 <div className="flex justify-between text-sm mb-2">
                   <span>{score.label}</span>
-                  <span className="font-mono">{Math.round(score.value * 100)}%</span>
+                  <span className="font-mono">
+                    {score.na ? "N/A" : `${Math.round(score.value * 100)}%`}
+                  </span>
                 </div>
-                <Progress value={Math.round(score.value * 100)} className="h-2" />
+                {!score.na && <Progress value={Math.round(score.value * 100)} className="h-2" />}
               </div>
             ))}
             <div className="rounded-lg bg-white/5 p-3 text-sm">
